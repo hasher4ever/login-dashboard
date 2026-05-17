@@ -22,7 +22,15 @@ import os
 import threading
 from typing import Optional
 
-MMDB_PATH = os.path.join(os.path.dirname(__file__), "data", "GeoLite2-City.mmdb")
+_DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+# Tries MaxMind GeoLite2 first (needs license key), falls back to DB-IP City
+# Lite (no signup, direct download). Same MMDB format — `maxminddb` reads
+# both. See scripts/setup_geolite2.sh and scripts/setup_dbip.sh.
+_MMDB_CANDIDATES = [
+    os.path.join(_DATA_DIR, "GeoLite2-City.mmdb"),
+    os.path.join(_DATA_DIR, "dbip-city-lite.mmdb"),
+]
+MMDB_PATH = next((p for p in _MMDB_CANDIDATES if os.path.exists(p)), _MMDB_CANDIDATES[0])
 FALLBACK_LATLNG = (0.0, -30.0)
 FALLBACK_LABEL = "unknown location"
 

@@ -24,10 +24,23 @@ Then open <http://localhost:8000>.
 
 ## GeoIP setup (one-time)
 
-The Map tab resolves IP → city using MaxMind GeoLite2-City offline. The
-demo scenarios use RFC5737 mock IPs that don't exist in any real GeoIP DB,
-so we keep a hand-typed override table for them in `geo.py`; real
-production IPs flow through the MMDB.
+The Map tab resolves IP → city using an offline MMDB file. Demo scenarios
+use RFC5737 mock IPs that don't exist in any real GeoIP DB, so we keep a
+hand-typed override table for them in `geo.py`; real production IPs go
+through the MMDB.
+
+Two options — pick one:
+
+### Option A: DB-IP City Lite (no signup, fastest setup)
+
+```sh
+./scripts/setup_dbip.sh
+```
+
+Downloads `data/dbip-city-lite.mmdb` (~125 MB, gitignored, CC-BY-4.0).
+Refreshed monthly — re-run on the 1st of any month to update.
+
+### Option B: MaxMind GeoLite2-City (more accurate, needs free signup)
 
 1. Sign up free at <https://www.maxmind.com/en/geolite2/signup>
 2. Generate a license key in your account portal
@@ -38,10 +51,12 @@ production IPs flow through the MMDB.
    ./scripts/setup_geolite2.sh
    ```
 
-The script writes `data/GeoLite2-City.mmdb` (~60 MB, gitignored). MaxMind
-refreshes the DB ~twice a week — re-run to update. Dashboard runs fine
-without it; real IPs just fall back to "unknown location" until the file
-is in place.
+Writes `data/GeoLite2-City.mmdb` (~60 MB, gitignored). MaxMind refreshes
+the DB ~twice a week.
+
+`geo.py` prefers MaxMind if both files are present, otherwise uses DB-IP.
+Dashboard runs fine with neither — real IPs fall back to "unknown
+location" until one of the files is in place.
 
 ## Scenarios (click buttons in the header)
 
@@ -70,7 +85,8 @@ Python 3.12. Only one runtime dependency: `maxminddb` (for GeoLite2 reads).
 | `main.py` | HTTP server, SSE, aggregator, alert rules, stubs, HTML |
 | `geo.py` | GeoLite2-City lookup + IP_GEO demo overrides |
 | `scenarios.py` | Pre-canned event streams |
-| `scripts/setup_geolite2.sh` | Download GeoLite2-City.mmdb with your license key |
+| `scripts/setup_geolite2.sh` | Download GeoLite2-City.mmdb with your MaxMind license key |
+| `scripts/setup_dbip.sh` | Download DB-IP City Lite MMDB (no signup) |
 
 ## What this is NOT
 
