@@ -14,10 +14,34 @@ auth integration yet; that conversation happens with Ravshan after the demo.
 ## Run
 
 ```sh
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 python3 main.py
 ```
 
 Then open <http://localhost:8000>.
+
+## GeoIP setup (one-time)
+
+The Map tab resolves IP → city using MaxMind GeoLite2-City offline. The
+demo scenarios use RFC5737 mock IPs that don't exist in any real GeoIP DB,
+so we keep a hand-typed override table for them in `geo.py`; real
+production IPs flow through the MMDB.
+
+1. Sign up free at <https://www.maxmind.com/en/geolite2/signup>
+2. Generate a license key in your account portal
+3. Drop the DB into `data/`:
+
+   ```sh
+   export MAXMIND_LICENSE_KEY=xxxxxxxxxxxxx
+   ./scripts/setup_geolite2.sh
+   ```
+
+The script writes `data/GeoLite2-City.mmdb` (~60 MB, gitignored). MaxMind
+refreshes the DB ~twice a week — re-run to update. Dashboard runs fine
+without it; real IPs just fall back to "unknown location" until the file
+is in place.
 
 ## Scenarios (click buttons in the header)
 
@@ -31,11 +55,12 @@ Then open <http://localhost:8000>.
 
 ## Stack
 
-Python 3.12 stdlib only. No `pip install`, no `requirements.txt`.
+Python 3.12. Only one runtime dependency: `maxminddb` (for GeoLite2 reads).
 
 - `http.server.ThreadingHTTPServer`
 - `threading` for SSE subscriber fan-out + scenario replay
 - HTMX via CDN
+- Leaflet via CDN (map tab)
 - Inline HTML template in `main.py`
 
 ## Files
@@ -43,7 +68,9 @@ Python 3.12 stdlib only. No `pip install`, no `requirements.txt`.
 | File | Purpose |
 |---|---|
 | `main.py` | HTTP server, SSE, aggregator, alert rules, stubs, HTML |
+| `geo.py` | GeoLite2-City lookup + IP_GEO demo overrides |
 | `scenarios.py` | Pre-canned event streams |
+| `scripts/setup_geolite2.sh` | Download GeoLite2-City.mmdb with your license key |
 
 ## What this is NOT
 

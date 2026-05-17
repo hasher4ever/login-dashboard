@@ -17,6 +17,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from geo import geolocate
 from scenarios import SCENARIOS
 
 PORT = int(os.environ.get("PORT", "8000"))
@@ -193,43 +194,8 @@ TAB_DEFS = [
 ]
 
 
-# Hardcoded GeoIP for demo IPs (RFC5737 reserved ranges don't really geolocate).
-# Production would replace this with MaxMind GeoLite2 (offline DB, 6 MB) or
-# a cached lookup from ipinfo.io. Coords are (lat, lng, country_label).
-IP_GEO: dict[str, tuple[float, float, str]] = {
-    # office IPs — Tashkent (operator HQ)
-    "198.51.100.12":  (41.311, 69.279, "Tashkent, UZ"),
-    "198.51.100.34":  (41.305, 69.291, "Tashkent, UZ"),
-    "198.51.100.78":  (41.299, 69.272, "Tashkent, UZ"),
-    # mobile carrier IPs — broader UZ
-    "192.0.2.41":     (39.654, 66.975, "Samarkand, UZ"),
-    "192.0.2.99":     (40.785, 72.336, "Andijan, UZ"),
-    "192.0.2.155":    (41.553, 60.633, "Urgench, UZ"),
-    # brute force attacker — Eastern Europe
-    "203.0.113.7":    (55.751, 37.618, "Moscow, RU"),
-    # token thief (geo_anomaly) — far away
-    "203.0.113.201":  (6.524,  3.379,  "Lagos, NG"),
-    # cred stuffing — distributed globally
-    "192.0.2.11":     (52.520, 13.405, "Berlin, DE"),
-    "192.0.2.22":     (-23.55, -46.633,"São Paulo, BR"),
-    "192.0.2.33":     (28.613, 77.209, "New Delhi, IN"),
-    "192.0.2.44":     (40.712, -74.006,"New York, US"),
-    "203.0.113.21":   (35.689, 139.692,"Tokyo, JP"),
-    "203.0.113.42":   (-33.868,151.209,"Sydney, AU"),
-    "203.0.113.63":   (51.507, -0.128, "London, GB"),
-    "203.0.113.84":   (19.432, -99.133,"Mexico City, MX"),
-    "198.51.100.51":  (37.774, -122.419,"San Francisco, US"),
-    "198.51.100.72":  (1.352,  103.820,"Singapore, SG"),
-    "198.51.100.93":  (59.329, 18.069, "Stockholm, SE"),
-    "198.51.100.114": (-1.286, 36.817, "Nairobi, KE"),
-}
-
-
-def geolocate(ip: str) -> tuple[float, float, str]:
-    """Return (lat, lng, label) for an IP. Falls back to mid-Atlantic for unknown."""
-    if ip in IP_GEO:
-        return IP_GEO[ip]
-    return (0.0, -30.0, "unknown location")
+# Geo lookup lives in geo.py — MaxMind GeoLite2-City offline MMDB with an
+# IP_GEO override table for the RFC5737 mock IPs used by scenarios.py.
 
 
 def render_page(active: str = "ips") -> str:
