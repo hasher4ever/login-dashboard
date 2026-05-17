@@ -1,0 +1,1261 @@
+"""
+login-dashboard — prototype.
+
+Live monitor for TMS360 signin attempts. Currently fed by mock scenarios from
+scenarios.py — no auth integration. Run with `python3 main.py`, open
+http://localhost:8000.
+"""
+
+import html
+import json
+import os
+import queue
+import sys
+import threading
+import time
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+from scenarios import SCENARIOS
+
+PORT = int(os.environ.get("PORT", "8000"))
+BUFFER_SIZE = 1000
+AGG_WINDOW_S = 300         # aggregates view = last 5 minutes
+ALERT_WINDOW_S = {
+    "brute_force": 30,
+    "cred_stuffing": 60,
+    "geo_anomaly": 300,
+}
+ALERT_TTL_S = 120          # alerts hang around 2 minutes after firing
+
+# ---------- mutable state (guarded by lock) ----------------------------------
+state_lock = threading.Lock()
+events: deque = deque(maxlen=BUFFER_SIZE)
+bans: dict[str, float] = {}        # ip -> unix-ts when ban expires
+allowlist: set[str] = set()
+alerts: list[dict] = []            # {at, kind, key, detail}
+sse_subs: list[queue.Queue] = []
+
+
+# ---------- helpers ----------------------------------------------------------
+def now() -> float:
+    return time.time()
+
+
+def iso(ts: float) -> str:
+    return time.strftime("%H:%M:%S", time.localtime(ts))
+
+
+def slash16(ip: str) -> str:
+    parts = ip.split(".")
+    return ".".join(parts[:2]) if len(parts) >= 2 else ip
+
+
+def log(msg: str) -> None:
+    print(f"[{iso(now())}] {msg}", file=sys.stderr, flush=True)
+
+
+# ---------- SSE fan-out ------------------------------------------------------
+def broadcast(event: str = "update", data: str = "ok") -> None:
+    payload = f"event: {event}\ndata: {data}\n\n"
+    dead = []
+    with state_lock:
+        subs = list(sse_subs)
+    for q in subs:
+        try:
+            q.put_nowait(payload)
+        except queue.Full:
+            dead.append(q)
+    if dead:
+        with state_lock:
+            for q in dead:
+                if q in sse_subs:
+                    sse_subs.remove(q)
+
+
+def sse_pinger():
+    while True:
+        time.sleep(20)
+        broadcast(event="ping", data="keepalive")
+
+
+# ---------- ingestion + alert rules ------------------------------------------
+def ingest_event(ev: dict) -> None:
+    """Append an event, update bans/alerts, and notify subscribers."""
+    ev = dict(ev)
+    ev["ts"] = now()
+    with state_lock:
+        events.append(ev)
+        _recompute_alerts_locked()
+    broadcast()
+
+
+def _recompute_alerts_locked() -> None:
+    """Fire alert entries based on current event buffer. Lock must be held."""
+    n = now()
+
+    # Prune expired alerts
+    alerts[:] = [a for a in alerts if n - a["at"] < ALERT_TTL_S]
+
+    # Snapshot window slices
+    win_bf = ALERT_WINDOW_S["brute_force"]
+    win_cs = ALERT_WINDOW_S["cred_stuffing"]
+    win_ga = ALERT_WINDOW_S["geo_anomaly"]
+
+    recent_bf = [e for e in events if n - e["ts"] <= win_bf]
+    recent_cs = [e for e in events if n - e["ts"] <= win_cs]
+    recent_ga = [e for e in events if n - e["ts"] <= win_ga]
+
+    # Rule 1: brute_force — IP with >= 5 fails in last 30s
+    fail_counts: dict[str, int] = {}
+    for e in recent_bf:
+        if not e["success"]:
+            fail_counts[e["ip"]] = fail_counts.get(e["ip"], 0) + 1
+    for ip, ct in fail_counts.items():
+        if ct >= 5:
+            _upsert_alert("brute_force", ip,
+                          f"{ct} failures in last {win_bf}s")
+
+    # Rule 2: cred_stuffing — username attempted by >= 3 distinct IPs in 60s
+    user_ips: dict[str, set] = {}
+    for e in recent_cs:
+        user_ips.setdefault(e["username"], set()).add(e["ip"])
+    for user, ips in user_ips.items():
+        if len(ips) >= 3:
+            _upsert_alert("cred_stuffing", user,
+                          f"{len(ips)} distinct IPs in last {win_cs}s")
+
+    # Rule 3: geo_anomaly — same user, successful, two distinct /16 prefixes
+    user_prefixes: dict[str, set] = {}
+    for e in recent_ga:
+        if e["success"]:
+            user_prefixes.setdefault(e["username"], set()).add(slash16(e["ip"]))
+    for user, pfx in user_prefixes.items():
+        if len(pfx) >= 2:
+            _upsert_alert("geo_anomaly", user,
+                          f"same user from {len(pfx)} IP prefixes in {win_ga}s")
+
+
+def _upsert_alert(kind: str, key: str, detail: str) -> None:
+    for a in alerts:
+        if a["kind"] == kind and a["key"] == key:
+            a["at"] = now()
+            a["detail"] = detail
+            return
+    alerts.append({"at": now(), "kind": kind, "key": key, "detail": detail})
+
+
+# ---------- aggregation for the table ---------------------------------------
+def aggregates_snapshot() -> list[dict]:
+    n = now()
+    with state_lock:
+        recent = [e for e in events if n - e["ts"] <= AGG_WINDOW_S]
+        ban_map = dict(bans)
+        allow = set(allowlist)
+    by_ip: dict[str, dict] = {}
+    for e in recent:
+        row = by_ip.setdefault(e["ip"], {
+            "ip": e["ip"], "ok": 0, "fail": 0,
+            "last_user": "", "last_ua": "", "last_ts": 0,
+        })
+        if e["success"]:
+            row["ok"] += 1
+        else:
+            row["fail"] += 1
+        if e["ts"] > row["last_ts"]:
+            row["last_ts"] = e["ts"]
+            row["last_user"] = e["username"]
+            row["last_ua"] = e["user_agent"]
+    rows = list(by_ip.values())
+    rows.sort(key=lambda r: (r["fail"], r["last_ts"]), reverse=True)
+    for r in rows:
+        ip = r["ip"]
+        if ip in allow:
+            r["status"] = "allowlist"
+            r["status_label"] = "Allow-listed"
+        elif ip in ban_map and ban_map[ip] > n:
+            r["status"] = "banned"
+            r["status_label"] = f"Banned until {iso(ban_map[ip])}"
+        else:
+            r["status"] = "clean"
+            r["status_label"] = ""
+    return rows
+
+
+# ---------- HTML rendering ---------------------------------------------------
+TAB_DEFS = [
+    ("ips",    "IPs",    "Aggregates by IP"),
+    ("alerts", "Alerts", "Rule firings"),
+    ("live",   "Live",   "Full feed history"),
+    ("map",    "Map",    "Geo + live feed (80/20)"),
+    ("bans",   "Bans",   "Active bans + allowlist"),
+]
+
+
+# Hardcoded GeoIP for demo IPs (RFC5737 reserved ranges don't really geolocate).
+# Production would replace this with MaxMind GeoLite2 (offline DB, 6 MB) or
+# a cached lookup from ipinfo.io. Coords are (lat, lng, country_label).
+IP_GEO: dict[str, tuple[float, float, str]] = {
+    # office IPs — Tashkent (operator HQ)
+    "198.51.100.12":  (41.311, 69.279, "Tashkent, UZ"),
+    "198.51.100.34":  (41.305, 69.291, "Tashkent, UZ"),
+    "198.51.100.78":  (41.299, 69.272, "Tashkent, UZ"),
+    # mobile carrier IPs — broader UZ
+    "192.0.2.41":     (39.654, 66.975, "Samarkand, UZ"),
+    "192.0.2.99":     (40.785, 72.336, "Andijan, UZ"),
+    "192.0.2.155":    (41.553, 60.633, "Urgench, UZ"),
+    # brute force attacker — Eastern Europe
+    "203.0.113.7":    (55.751, 37.618, "Moscow, RU"),
+    # token thief (geo_anomaly) — far away
+    "203.0.113.201":  (6.524,  3.379,  "Lagos, NG"),
+    # cred stuffing — distributed globally
+    "192.0.2.11":     (52.520, 13.405, "Berlin, DE"),
+    "192.0.2.22":     (-23.55, -46.633,"São Paulo, BR"),
+    "192.0.2.33":     (28.613, 77.209, "New Delhi, IN"),
+    "192.0.2.44":     (40.712, -74.006,"New York, US"),
+    "203.0.113.21":   (35.689, 139.692,"Tokyo, JP"),
+    "203.0.113.42":   (-33.868,151.209,"Sydney, AU"),
+    "203.0.113.63":   (51.507, -0.128, "London, GB"),
+    "203.0.113.84":   (19.432, -99.133,"Mexico City, MX"),
+    "198.51.100.51":  (37.774, -122.419,"San Francisco, US"),
+    "198.51.100.72":  (1.352,  103.820,"Singapore, SG"),
+    "198.51.100.93":  (59.329, 18.069, "Stockholm, SE"),
+    "198.51.100.114": (-1.286, 36.817, "Nairobi, KE"),
+}
+
+
+def geolocate(ip: str) -> tuple[float, float, str]:
+    """Return (lat, lng, label) for an IP. Falls back to mid-Atlantic for unknown."""
+    if ip in IP_GEO:
+        return IP_GEO[ip]
+    return (0.0, -30.0, "unknown location")
+
+
+def render_page(active: str = "ips") -> str:
+    tabs = []
+    for slug, label, _desc in TAB_DEFS:
+        cls = "tab active" if slug == active else "tab"
+        if slug == "map":
+            # Map tab uses JS toggle, NOT HTMX swap, so the persistent map
+            # DOM survives across tab switches and SSE ticks. This is the
+            # default tab — page loads with it visible.
+            tabs.append(
+                f'<button class="{cls}" onclick="showMap(this); return false;">'
+                f'{label}</button>'
+            )
+        else:
+            tabs.append(
+                f'<button class="{cls}" '
+                f'hx-get="/partials/{slug}" hx-target="#content" hx-swap="outerHTML" '
+                f'onclick="hideMap(this);">'
+                f'{label}</button>'
+            )
+    tab_bar = "\n".join(tabs)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Login Monitor (PROTOTYPE)</title>
+<script src="https://unpkg.com/htmx.org@2.0.3"></script>
+<script src="https://unpkg.com/htmx-ext-sse@2.2.2"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>{CSS}</style>
+</head>
+<body>
+<header>
+  <div class="title">
+    Login Monitor
+    <span class="tag">PROTOTYPE — mock data</span>
+    <span class="subtitle">stdlib + HTMX + SSE · localhost · stub actions only</span>
+  </div>
+  <div class="scenarios">
+    <button hx-post="/scenario/steady_state"  hx-swap="none">▶ steady_state</button>
+    <button hx-post="/scenario/brute_force"   hx-swap="none" class="danger">▶ brute_force</button>
+    <button hx-post="/scenario/cred_stuffing" hx-swap="none" class="danger">▶ cred_stuffing</button>
+    <button hx-post="/scenario/geo_anomaly"   hx-swap="none" class="warn">▶ geo_anomaly</button>
+    <button hx-post="/scenario/clear"         hx-swap="none" class="ghost">⨯ clear</button>
+  </div>
+</header>
+
+<nav class="tabs">{tab_bar}</nav>
+
+<main hx-ext="sse" sse-connect="/events">
+  <div id="content"
+       hx-get="/partials/{active}"
+       hx-trigger="load, sse:update, every 5s"
+       hx-swap="outerHTML">
+    Loading…
+  </div>
+
+  <!-- Persistent map+feed container; toggled by `main.show-map` CSS class.
+       Using a class on the parent (rather than inline style on the wrapper)
+       so HTMX swaps inside #content cannot clobber visibility state. -->
+  <div id="map-wrapper">
+    <div class="map-split">
+      <section class="panel map-panel">
+        <h2>Geographic distribution <span id="map-stat" class="muted"></span></h2>
+        <div class="map-legend">
+          <span class="dot" style="background:#6cb2ff"></span>clean
+          <span class="dot" style="background:#ffc14a"></span>mixed
+          <span class="dot" style="background:#ff8a96"></span>hot
+          <span class="dot" style="background:#ff4d63"></span>banned
+          <span class="dot" style="background:#6cdb8c"></span>allowlisted
+          <span style="flex:1"></span>
+          <button class="ghost" onclick="refreshMarkers();">↻ refresh</button>
+        </div>
+        <div id="login-map"></div>
+      </section>
+      <section class="panel side-feed-panel">
+        <h2>Live feed <span id="feed-stat" class="muted"></span></h2>
+        <div id="feed-side">
+          <p class="muted">Waiting for events… (click a scenario above)</p>
+        </div>
+      </section>
+    </div>
+  </div>
+</main>
+
+<script>{MAP_JS}</script>
+</body>
+</html>"""
+
+
+def _wrap(slug: str, inner: str) -> str:
+    """Wrap a tab's body in a fresh #content div with its own hx-get + sse trigger."""
+    return (
+        f'<div id="content" '
+        f'hx-get="/partials/{slug}" '
+        f'hx-trigger="sse:update, every 5s" '
+        f'hx-swap="outerHTML">'
+        f'{inner}'
+        f'</div>'
+    )
+
+
+def render_ips_panel() -> str:
+    rows = aggregates_snapshot()
+    inner = f"""
+<section class="panel">
+  <h2>Aggregates by IP <span class="muted">(last {AGG_WINDOW_S // 60} min, sorted by fail count)</span></h2>
+  {_render_agg_table(rows, now())}
+</section>"""
+    return _wrap("ips", inner)
+
+
+def render_alerts_panel() -> str:
+    with state_lock:
+        cur_alerts = sorted(alerts, key=lambda a: a["at"], reverse=True)
+    inner = f"""
+<section class="panel">
+  <h2>Active alerts <span class="muted">(rule-based, auto-expire after {ALERT_TTL_S // 60} min idle)</span></h2>
+  {_render_alerts(cur_alerts)}
+</section>"""
+    return _wrap("alerts", inner)
+
+
+def render_live_panel() -> str:
+    with state_lock:
+        feed = list(events)[-100:]
+    feed.reverse()
+    inner = f"""
+<section class="panel">
+  <h2>Live feed <span class="muted">({len(events)} buffered, showing last {len(feed)})</span></h2>
+  {_render_feed(feed)}
+</section>"""
+    return _wrap("live", inner)
+
+
+def feed_json() -> str:
+    """JSON payload for the side feed: most recent events, newest first."""
+    with state_lock:
+        snap = list(events)
+        total = len(events)
+    snap.reverse()
+    out = []
+    for e in snap[:80]:
+        out.append({
+            "ts": iso(e["ts"]),
+            "success": e["success"],
+            "ip": e["ip"],
+            "username": e["username"],
+        })
+    return json.dumps({"events": out, "total": total})
+
+
+def map_markers_json() -> str:
+    """JSON payload for the Map tab. Pure data, no HTML."""
+    n = now()
+    with state_lock:
+        recent = [e for e in events if n - e["ts"] <= AGG_WINDOW_S]
+        ban_map = dict(bans)
+        allow = set(allowlist)
+    by_ip: dict[str, dict] = {}
+    for e in recent:
+        row = by_ip.setdefault(e["ip"], {"ok": 0, "fail": 0, "last_user": "", "last_ts": 0})
+        if e["success"]:
+            row["ok"] += 1
+        else:
+            row["fail"] += 1
+        if e["ts"] > row["last_ts"]:
+            row["last_ts"] = e["ts"]
+            row["last_user"] = e["username"]
+    markers = []
+    for ip, row in by_ip.items():
+        lat, lng, label = geolocate(ip)
+        if ip in allow:
+            color, status = "#6cdb8c", "allowlisted"
+        elif ip in ban_map and ban_map[ip] > n:
+            color, status = "#ff4d63", "banned"
+        elif row["fail"] >= 5:
+            color, status = "#ff8a96", "hot"
+        elif row["fail"] > 0:
+            color, status = "#ffc14a", "mixed"
+        else:
+            color, status = "#6cb2ff", "clean"
+        markers.append({
+            "ip": ip, "lat": lat, "lng": lng, "label": label,
+            "ok": row["ok"], "fail": row["fail"],
+            "user": row["last_user"], "color": color, "status": status,
+        })
+    return json.dumps({"markers": markers, "window_min": AGG_WINDOW_S // 60})
+
+
+def render_bans_panel() -> str:
+    n = now()
+    with state_lock:
+        cur_bans = [(ip, exp) for ip, exp in bans.items() if exp > n]
+        cur_allow = list(allowlist)
+    cur_bans.sort(key=lambda b: b[1])
+    cur_allow.sort()
+    inner = f"""
+<section class="panel">
+  <h2>Banned IPs <span class="muted">({len(cur_bans)} active)</span></h2>
+  {_render_bans_table(cur_bans, n)}
+</section>
+
+<section class="panel">
+  <h2>Allowlisted IPs <span class="muted">({len(cur_allow)} entries)</span></h2>
+  {_render_allow_table(cur_allow)}
+</section>"""
+    return _wrap("bans", inner)
+
+
+def _render_agg_table(rows: list[dict], n: float) -> str:
+    if not rows:
+        return '<p class="muted">No events yet. Click a scenario above to play.</p>'
+    body = []
+    for r in rows:
+        action = _render_action_cell(r)
+        cls = "row-banned" if r["status"] == "banned" else \
+              "row-allow"   if r["status"] == "allowlist" else \
+              "row-hot"     if r["fail"] >= 5 else ""
+        body.append(f"""
+<tr class="{cls}">
+  <td class="ip">{html.escape(r["ip"])}</td>
+  <td class="num ok">{r["ok"]}</td>
+  <td class="num fail">{r["fail"]}</td>
+  <td>{html.escape(r["last_user"])}</td>
+  <td class="ua">{html.escape(_short_ua(r["last_ua"]))}</td>
+  <td class="ts">{iso(r["last_ts"]) if r["last_ts"] else ""}</td>
+  <td class="status">{html.escape(r["status_label"])}</td>
+  <td class="actions">{action}</td>
+</tr>""")
+    return f"""<table class="agg">
+<thead><tr>
+  <th>IP</th><th>OK</th><th>FAIL</th><th>Last user</th>
+  <th>UA</th><th>Last seen</th><th>Status</th><th>Action</th>
+</tr></thead>
+<tbody>{''.join(body)}</tbody>
+</table>"""
+
+
+def _render_action_cell(r: dict) -> str:
+    ip = html.escape(r["ip"])
+    if r["status"] == "banned":
+        return f"""<form hx-post="/unban" hx-swap="none" class="inline">
+          <input type="hidden" name="ip" value="{ip}">
+          <button class="ghost">Unban</button>
+        </form>"""
+    if r["status"] == "allowlist":
+        return f"""<span class="muted">on allowlist</span>"""
+    return f"""<details class="ban-menu">
+  <summary class="danger">Ban ▾</summary>
+  <div class="ban-options">
+    {_ban_btn(ip, 900,  "15 min")}
+    {_ban_btn(ip, 3600, "1 hour")}
+    {_ban_btn(ip, 86400,"24 hours")}
+    <form hx-post="/whitelist" hx-swap="none" class="inline">
+      <input type="hidden" name="ip" value="{ip}">
+      <button class="good">Whitelist</button>
+    </form>
+  </div>
+</details>"""
+
+
+def _ban_btn(ip: str, ttl: int, label: str) -> str:
+    return f"""<form hx-post="/ban" hx-swap="none" class="inline">
+  <input type="hidden" name="ip" value="{ip}">
+  <input type="hidden" name="ttl" value="{ttl}">
+  <button class="danger">{label}</button>
+</form>"""
+
+
+def _render_alerts(cur_alerts: list[dict]) -> str:
+    if not cur_alerts:
+        return '<p class="muted">Quiet. No active alerts.</p>'
+    body = []
+    for a in cur_alerts:
+        body.append(f"""
+<li class="alert-{a['kind']}">
+  <span class="kind">{a['kind'].replace('_', ' ')}</span>
+  <span class="key">{html.escape(a['key'])}</span>
+  <span class="detail">{html.escape(a['detail'])}</span>
+  <span class="muted at">{iso(a['at'])}</span>
+</li>""")
+    return f"<ul class='alerts'>{''.join(body)}</ul>"
+
+
+def _render_feed(feed: list[dict]) -> str:
+    if not feed:
+        return '<p class="muted">Feed is empty.</p>'
+    body = []
+    for e in feed:
+        cls = "ok" if e["success"] else "fail"
+        body.append(f"""
+<tr class="feed-{cls}">
+  <td class="ts">{iso(e["ts"])}</td>
+  <td class="verdict">{'OK  ' if e["success"] else 'FAIL'}</td>
+  <td class="ip">{html.escape(e["ip"])}</td>
+  <td>{html.escape(e["username"])}</td>
+  <td class="ua">{html.escape(_short_ua(e["user_agent"]))}</td>
+  <td class="muted">{html.escape(e.get("failure_reason") or "")}</td>
+</tr>""")
+    return f"<table class='feed'><tbody>{''.join(body)}</tbody></table>"
+
+
+def _render_bans_table(cur_bans: list, n: float) -> str:
+    if not cur_bans:
+        return '<p class="muted">No active bans. Ban an IP from the IPs tab to see it here.</p>'
+    body = []
+    for ip, exp in cur_bans:
+        remaining = int(exp - n)
+        body.append(f"""
+<tr>
+  <td class="ip">{html.escape(ip)}</td>
+  <td class="muted">{html.escape(geolocate(ip)[2])}</td>
+  <td class="ts">until {iso(exp)} <span class="muted">({_fmt_remaining(remaining)})</span></td>
+  <td class="actions">
+    <form hx-post="/unban" hx-swap="none" class="inline">
+      <input type="hidden" name="ip" value="{html.escape(ip)}">
+      <button class="ghost">Unban</button>
+    </form>
+  </td>
+</tr>""")
+    return f"""<table class="agg">
+<thead><tr><th>IP</th><th>Location</th><th>Expires</th><th></th></tr></thead>
+<tbody>{''.join(body)}</tbody></table>"""
+
+
+def _render_allow_table(cur_allow: list) -> str:
+    if not cur_allow:
+        return '<p class="muted">No allowlisted IPs.</p>'
+    body = []
+    for ip in cur_allow:
+        body.append(f"""
+<tr>
+  <td class="ip">{html.escape(ip)}</td>
+  <td class="muted">{html.escape(geolocate(ip)[2])}</td>
+  <td class="actions">
+    <form hx-post="/unallow" hx-swap="none" class="inline">
+      <input type="hidden" name="ip" value="{html.escape(ip)}">
+      <button class="ghost">Remove</button>
+    </form>
+  </td>
+</tr>""")
+    return f"""<table class="agg">
+<thead><tr><th>IP</th><th>Location</th><th></th></tr></thead>
+<tbody>{''.join(body)}</tbody></table>"""
+
+
+def _fmt_remaining(secs: int) -> str:
+    if secs < 60:
+        return f"{secs}s left"
+    if secs < 3600:
+        return f"{secs // 60}m {secs % 60}s left"
+    return f"{secs // 3600}h {(secs % 3600) // 60}m left"
+
+
+def _short_ua(ua: str) -> str:
+    if not ua:
+        return ""
+    if "curl" in ua:
+        return "curl"
+    if "python-requests" in ua:
+        return "python-requests"
+    if "Firefox" in ua:
+        return "Firefox"
+    if "Chrome" in ua:
+        return "Chrome"
+    if "Safari" in ua:
+        return "Safari"
+    return ua[:24]
+
+
+MAP_JS = """
+let _mapInstance = null;
+let _markerLayer = null;
+let _tileLayer = null;
+let _lastMapRefresh = 0;
+let _popupOpen = false;
+let _currentStyle = 'carto_dark';
+
+// Attribution strings required by tile licenses.
+var _CARTO_ATTR = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>';
+var _ESRI_ATTR = 'Tiles &copy; <a href="https://www.esri.com">Esri</a>';
+
+var TILE_PROVIDERS = {
+  carto_dark: {
+    label: 'CARTO Dark',
+    url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    opts: { subdomains: 'abcd', maxZoom: 19, detectRetina: true, attribution: _CARTO_ATTR },
+  },
+  carto_light: {
+    label: 'CARTO Light',
+    url: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+    opts: { subdomains: 'abcd', maxZoom: 19, detectRetina: true, attribution: _CARTO_ATTR },
+  },
+  carto_voyager: {
+    label: 'CARTO Voyager',
+    url: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
+    opts: { subdomains: 'abcd', maxZoom: 19, detectRetina: true, attribution: _CARTO_ATTR },
+  },
+  opentopomap: {
+    label: 'OpenTopoMap',
+    url: 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
+    opts: {
+      subdomains: 'abc', maxZoom: 17,
+      attribution: 'Map data: &copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>, SRTM | Style: <a href="https://opentopomap.org">OpenTopoMap</a> (CC-BY-SA)',
+    },
+  },
+  esri_satellite: {
+    label: 'ESRI Satellite',
+    url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    opts: { maxZoom: 19, attribution: _ESRI_ATTR },
+  },
+};
+
+function setMapStyle(name) {
+  if (!_mapInstance || !TILE_PROVIDERS[name]) return;
+  if (_tileLayer) _mapInstance.removeLayer(_tileLayer);
+  var p = TILE_PROVIDERS[name];
+  _tileLayer = L.tileLayer(p.url, p.opts).addTo(_mapInstance);
+  _currentStyle = name;
+}
+
+function _addStylePicker(map) {
+  var ctl = L.control({ position: 'topright' });
+  ctl.onAdd = function() {
+    var div = L.DomUtil.create('div', 'leaflet-bar style-picker');
+    var html = '';
+    Object.keys(TILE_PROVIDERS).forEach(function(key) {
+      var active = (key === _currentStyle) ? ' active' : '';
+      html += '<button data-style="' + key + '" class="sp-btn' + active + '">' + TILE_PROVIDERS[key].label + '</button>';
+    });
+    div.innerHTML = html;
+    L.DomEvent.disableClickPropagation(div);
+    div.addEventListener('click', function(e) {
+      var btn = e.target.closest('button');
+      if (!btn) return;
+      var style = btn.getAttribute('data-style');
+      if (!style) return;
+      setMapStyle(style);
+      div.querySelectorAll('button').forEach(function(b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+    });
+    return div;
+  };
+  ctl.addTo(map);
+}
+
+function _addFullscreenControl(map) {
+  var ctl = L.control({ position: 'topleft' });  // next to zoom +/- controls
+  ctl.onAdd = function() {
+    var div = L.DomUtil.create('div', 'leaflet-bar fs-control');
+    div.innerHTML = '<a href="#" title="Toggle fullscreen">\\u26F6</a>';
+    L.DomEvent.disableClickPropagation(div);
+    div.querySelector('a').addEventListener('click', function(e) {
+      e.preventDefault();
+      var c = map.getContainer();
+      if (document.fullscreenElement) {
+        document.exitFullscreen();
+      } else {
+        c.requestFullscreen().catch(function() {});
+      }
+      setTimeout(function() { map.invalidateSize(); }, 200);
+    });
+    return div;
+  };
+  ctl.addTo(map);
+}
+
+function _setActive(btn) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+}
+
+function showMap(btn) {
+  _setActive(btn);
+  document.querySelector('main').classList.add('show-map');
+  if (!_mapInstance) {
+    _mapInstance = L.map('login-map', {
+      worldCopyJump: true,
+      closePopupOnClick: false,  // popup buttons need clicks; map-click won't auto-close
+      attributionControl: false, // disable default (bottomright); custom one below at bottomleft
+    }).setView([30, 30], 2);
+    L.control.attribution({ position: 'bottomleft', prefix: false }).addTo(_mapInstance);
+    setMapStyle('carto_dark');
+    _markerLayer = L.layerGroup().addTo(_mapInstance);
+    _addStylePicker(_mapInstance);
+    _addFullscreenControl(_mapInstance);
+    _mapInstance.on('popupopen',  function() { _popupOpen = true;  });
+    _mapInstance.on('popupclose', function() { _popupOpen = false; });
+  }
+  // Force Leaflet to recompute size now that container is visible.
+  setTimeout(function() { _mapInstance.invalidateSize(); }, 50);
+  refreshMarkers();
+  refreshSideFeed();
+}
+
+function hideMap(btn) {
+  _setActive(btn);
+  document.querySelector('main').classList.remove('show-map');
+}
+
+function _escape(s) {
+  return String(s).replace(/[&<>"']/g, function(c) {
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+
+function _popupHtml(m) {
+  var ipSafe = _escape(m.ip);
+  return (
+    '<b>' + ipSafe + '</b><br>' +
+    _escape(m.label) + '<br>' +
+    '<span style="color:#6cdb8c">OK ' + m.ok + '</span> &nbsp; ' +
+    '<span style="color:#ff8a96">FAIL ' + m.fail + '</span><br>' +
+    'last user: ' + _escape(m.user || '\\u2014') + '<br>' +
+    'status: ' + _escape(m.status) +
+    '<div class="popup-actions">' +
+      '<button onclick="event.stopPropagation(); banFromPopup(\\'' + ipSafe + '\\', 900); return false;">Ban 15m</button>' +
+      '<button onclick="event.stopPropagation(); banFromPopup(\\'' + ipSafe + '\\', 3600); return false;">1h</button>' +
+      '<button onclick="event.stopPropagation(); banFromPopup(\\'' + ipSafe + '\\', 86400); return false;">24h</button>' +
+      '<button onclick="event.stopPropagation(); whitelistFromPopup(\\'' + ipSafe + '\\'); return false;" class="good">Allow</button>' +
+    '</div>'
+  );
+}
+
+function banFromPopup(ip, ttl) {
+  var fd = new FormData();
+  fd.append('ip', ip);
+  fd.append('ttl', String(ttl));
+  fetch('/ban', { method: 'POST', body: fd }).then(function() {
+    if (_mapInstance) _mapInstance.closePopup();
+    refreshMarkers();
+  });
+}
+
+function whitelistFromPopup(ip) {
+  var fd = new FormData();
+  fd.append('ip', ip);
+  fetch('/whitelist', { method: 'POST', body: fd }).then(function() {
+    if (_mapInstance) _mapInstance.closePopup();
+    refreshMarkers();
+  });
+}
+
+function refreshMarkers() {
+  if (!_mapInstance || !_markerLayer) return;
+  if (_popupOpen) return;  // don't clobber an open popup with a marker refresh
+  _lastMapRefresh = Date.now();
+  fetch('/api/map-markers').then(function(r) { return r.json(); }).then(function(data) {
+    _markerLayer.clearLayers();
+    data.markers.forEach(function(m) {
+      var radius = Math.max(7, Math.min(22, 6 + (m.ok + m.fail) * 1.5));
+      L.circleMarker([m.lat, m.lng], {
+        radius: radius,
+        color: m.color,
+        weight: 2,
+        fillColor: m.color,
+        fillOpacity: 0.45,
+      }).bindPopup(_popupHtml(m)).addTo(_markerLayer);
+    });
+    var stat = document.getElementById('map-stat');
+    if (stat) stat.textContent = '(' + data.markers.length + ' unique IPs · last ' + data.window_min + ' min)';
+  });
+}
+
+function refreshSideFeed() {
+  fetch('/api/feed').then(function(r) { return r.json(); }).then(function(data) {
+    var host = document.getElementById('feed-side');
+    if (!host) return;
+    if (!data.events.length) {
+      host.innerHTML = '<p class="muted">No events. Click a scenario above.</p>';
+    } else {
+      var rows = data.events.map(function(e) {
+        var verdict = e.success ? 'OK' : 'FAIL';
+        var cls = e.success ? 'ok' : 'fail';
+        return (
+          '<div class="feed-row feed-' + cls + '">' +
+            '<span class="t">' + _escape(e.ts) + '</span>' +
+            '<span class="v">' + verdict + '</span>' +
+            '<span class="ip">' + _escape(e.ip) + '</span>' +
+            '<span class="u">' + _escape(e.username) + '</span>' +
+          '</div>'
+        );
+      }).join('');
+      host.innerHTML = rows;
+    }
+    var stat = document.getElementById('feed-stat');
+    if (stat) stat.textContent = '(' + data.total + ' buffered, newest first)';
+  });
+}
+
+// SSE-driven refresh: only when map is visible, throttled to 1.5s max.
+document.body.addEventListener('htmx:sseMessage', function(ev) {
+  if (!ev.detail || ev.detail.type !== 'update') return;
+  if (!document.querySelector('main').classList.contains('show-map')) return;
+  if (Date.now() - _lastMapRefresh < 1500) return;
+  refreshMarkers();
+  refreshSideFeed();
+});
+"""
+
+
+CSS = """
+* { box-sizing: border-box; }
+body {
+  margin: 0; font-family: -apple-system, BlinkMacSystemFont, "SF Mono", Menlo, monospace;
+  background: #0b0d10; color: #e6e6e6; font-size: 13px;
+}
+header {
+  background: #11151a; border-bottom: 1px solid #1f2730;
+  padding: 12px 20px; display: flex; align-items: center; justify-content: space-between;
+  position: sticky; top: 0; z-index: 10;
+}
+.title { font-weight: 600; font-size: 15px; }
+.tag {
+  margin-left: 10px; background: #3b2a00; color: #ffc14a;
+  padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 500;
+}
+.subtitle {
+  margin-left: 10px; color: #4a5260; font-size: 11px; font-weight: 400;
+}
+.scenarios { display: flex; gap: 8px; }
+button {
+  background: #1c232c; color: #e6e6e6; border: 1px solid #2a3340;
+  padding: 5px 12px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 12px;
+}
+button:hover { background: #242c37; border-color: #3a4757; }
+button.danger { background: #2a1417; border-color: #5a262f; color: #ff8a96; }
+button.danger:hover { background: #3a1d22; }
+button.warn { background: #2a2414; border-color: #5a4a26; color: #ffc14a; }
+button.good { background: #14271a; border-color: #275a35; color: #6cdb8c; }
+button.ghost { background: transparent; border-color: #2a3340; color: #889; }
+
+nav.tabs {
+  display: flex; gap: 2px; padding: 0 20px;
+  background: #0b0d10; border-bottom: 1px solid #1f2730;
+  position: sticky; top: 53px; z-index: 9;
+}
+.tab {
+  background: transparent; color: #889; border: 1px solid transparent;
+  border-radius: 4px 4px 0 0; padding: 8px 18px;
+  cursor: pointer; font-family: inherit; font-size: 13px;
+  border-bottom: 2px solid transparent;
+}
+.tab:hover { color: #ccd; background: #11151a; }
+.tab.active {
+  color: #e6e6e6; background: #11151a;
+  border-bottom-color: #6cb2ff;
+}
+
+main { padding: 16px 20px; }
+/* Tab toggle: default = #content visible, #map-wrapper hidden.
+   When .show-map is on <main>, swap them. Class lives on a parent that
+   HTMX swaps never touch, so visibility stays correct across SSE refreshes. */
+#map-wrapper { display: none; }
+main.show-map #content { display: none; }
+main.show-map #map-wrapper { display: block; }
+.panel {
+  background: #11151a; border: 1px solid #1f2730;
+  border-radius: 6px; padding: 14px 16px; margin-bottom: 14px;
+}
+.panel h2 {
+  margin: 0 0 10px 0; font-size: 13px; font-weight: 600;
+  color: #ccd; text-transform: uppercase; letter-spacing: 0.5px;
+}
+.muted { color: #687080; font-weight: 400; }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #1a2027; }
+th { color: #889; font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.3px; }
+td.num { font-variant-numeric: tabular-nums; text-align: right; width: 50px; }
+td.ok { color: #6cdb8c; }
+td.fail { color: #ff8a96; font-weight: 600; }
+td.ts, td.ua { color: #889; font-size: 12px; }
+td.ip { font-weight: 600; }
+td.actions { text-align: right; }
+td.verdict { font-weight: 600; width: 50px; font-family: "SF Mono", monospace; }
+
+.feed-ok td.verdict { color: #6cdb8c; }
+.feed-fail td.verdict { color: #ff8a96; }
+.feed-fail { background: rgba(255, 138, 150, 0.04); }
+
+.row-hot { background: rgba(255, 138, 150, 0.06); }
+.row-banned { background: rgba(255, 138, 150, 0.12); opacity: 0.85; }
+.row-allow { background: rgba(108, 219, 140, 0.06); }
+
+.ban-menu { display: inline-block; position: relative; }
+.ban-menu summary {
+  list-style: none; cursor: pointer; user-select: none;
+  background: #2a1417; border: 1px solid #5a262f; color: #ff8a96;
+  padding: 4px 10px; border-radius: 4px; font-size: 12px;
+}
+.ban-menu summary::-webkit-details-marker { display: none; }
+.ban-menu[open] .ban-options {
+  position: absolute; right: 0; top: 28px; background: #11151a;
+  border: 1px solid #2a3340; border-radius: 4px; padding: 6px; z-index: 5;
+  display: flex; flex-direction: column; gap: 4px; min-width: 110px;
+}
+form.inline { display: inline; margin: 0; }
+
+.alerts { list-style: none; padding: 0; margin: 0; }
+.alerts li {
+  display: grid; grid-template-columns: 130px 220px 1fr 80px;
+  gap: 12px; padding: 6px 8px; border-bottom: 1px solid #1a2027; align-items: center;
+}
+.alerts li:last-child { border-bottom: none; }
+.alerts .kind {
+  text-transform: uppercase; font-size: 11px; font-weight: 600; letter-spacing: 0.5px;
+  padding: 2px 6px; border-radius: 3px;
+}
+.alert-brute_force .kind   { background: #2a1417; color: #ff8a96; }
+.alert-cred_stuffing .kind { background: #2a2414; color: #ffc14a; }
+.alert-geo_anomaly .kind   { background: #14202a; color: #6cb2ff; }
+.alerts .key { font-weight: 600; }
+.alerts .detail { color: #aab; font-size: 12px; }
+.alerts .at { text-align: right; font-size: 11px; }
+
+body { overflow: hidden; }  /* page must fit viewport; no scroll */
+
+.map-split {
+  display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 3fr);
+  gap: 14px; align-items: stretch;
+  height: calc(100vh - 130px);
+}
+.map-split > .panel { margin-bottom: 0; display: flex; flex-direction: column; min-width: 0; }
+.map-panel { padding-bottom: 12px; }
+.map-legend {
+  display: flex; gap: 14px; margin-bottom: 10px;
+  font-size: 12px; color: #aab; align-items: center; flex-wrap: wrap;
+}
+.map-legend .dot {
+  display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+  margin: 0 4px 0 0; vertical-align: middle;
+}
+#login-map {
+  flex: 1 1 auto; min-height: 300px;
+  border-radius: 4px; background: #1a2027;
+}
+.leaflet-container { background: #1a2027 !important; }
+/* Map style picker (custom Leaflet control, top-right) */
+.style-picker {
+  background: rgba(17, 21, 26, 0.92) !important;
+  border: 1px solid #2a3340 !important;
+  border-radius: 6px !important;
+  padding: 3px !important;
+  display: flex; flex-direction: column; gap: 1px;
+  min-width: 160px;
+  max-height: calc(100vh - 200px);
+  overflow-y: auto;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+.style-picker .sp-btn {
+  background: transparent; color: #aab; border: none;
+  padding: 4px 9px; cursor: pointer; font-size: 11px;
+  border-radius: 3px; text-align: left;
+  font-family: inherit; line-height: 1.3;
+  white-space: nowrap;
+}
+.style-picker .sp-btn:hover { background: rgba(255,255,255,0.05); color: #e6e6e6; }
+.style-picker .sp-btn.active {
+  background: rgba(108, 178, 255, 0.15); color: #6cb2ff; font-weight: 600;
+}
+
+/* Fullscreen toggle (separate Leaflet control, sits below style picker) */
+.fs-control {
+  background: rgba(17, 21, 26, 0.92) !important;
+  border: 1px solid #2a3340 !important;
+  border-radius: 6px !important;
+  margin-top: 6px !important;
+  width: auto !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+}
+.fs-control a {
+  display: block; width: 30px; height: 30px;
+  line-height: 30px; text-align: center;
+  color: #aab; text-decoration: none; font-size: 16px;
+  background: transparent;
+}
+.fs-control a:hover { background: rgba(255,255,255,0.05); color: #e6e6e6; }
+
+/* Dark-themed attribution (bottom-left corner of map) */
+.leaflet-control-attribution {
+  background: rgba(17, 21, 26, 0.85) !important;
+  color: #687080 !important;
+  border: 1px solid #1f2730 !important;
+  border-radius: 3px !important;
+  font-size: 10px !important;
+  padding: 2px 6px !important;
+  margin: 4px !important;
+}
+.leaflet-control-attribution a { color: #6cb2ff !important; }
+.leaflet-control-attribution a:hover { color: #8cc3ff !important; }
+
+.leaflet-popup-content-wrapper { background: #11151a; color: #e6e6e6; border-radius: 4px; }
+.leaflet-popup-tip { background: #11151a; }
+.leaflet-popup-content { font-size: 12px; margin: 10px 12px; }
+.leaflet-popup-content b { color: #ffc14a; }
+.popup-actions { margin-top: 10px; display: flex; gap: 4px; flex-wrap: wrap; }
+.popup-actions button {
+  background: #2a1417; border: 1px solid #5a262f; color: #ff8a96;
+  padding: 4px 8px; border-radius: 3px; font-size: 11px; cursor: pointer;
+  font-family: inherit;
+}
+.popup-actions button.good { background: #14271a; border-color: #275a35; color: #6cdb8c; }
+
+.side-feed-panel { overflow: hidden; }
+#feed-side {
+  flex: 1 1 auto;
+  overflow: hidden;   /* per spec: older records disappear, no scroll */
+  display: flex; flex-direction: column;
+}
+.feed-row {
+  display: grid;
+  grid-template-columns: 58px 38px 110px 1fr;
+  column-gap: 8px; align-items: center;
+  padding: 4px 8px; border-bottom: 1px solid #1a2027;
+  font-size: 11px; line-height: 1.4; flex: 0 0 auto;
+  white-space: nowrap;
+}
+.feed-row > * { overflow: hidden; text-overflow: ellipsis; }
+.feed-row .t { color: #687080; font-variant-numeric: tabular-nums; }
+.feed-row .v { font-weight: 600; }
+.feed-row .ip { color: #ccd; font-weight: 500; }
+.feed-row .u { color: #aab; }
+.feed-ok .v { color: #6cdb8c; }
+.feed-fail .v { color: #ff8a96; }
+.feed-fail { background: rgba(255, 138, 150, 0.04); }
+"""
+
+
+# ---------- scenario player --------------------------------------------------
+_scenario_lock = threading.Lock()
+_active_scenarios: list[threading.Thread] = []
+
+
+def play_scenario(name: str) -> bool:
+    if name not in SCENARIOS:
+        return False
+    log(f"play scenario: {name}")
+    t = threading.Thread(target=_play_thread, args=(name,), daemon=True)
+    with _scenario_lock:
+        _active_scenarios.append(t)
+    t.start()
+    return True
+
+
+def _play_thread(name: str) -> None:
+    for delay_ms, ev in SCENARIOS[name]:
+        time.sleep(delay_ms / 1000.0)
+        ingest_event(ev)
+
+
+def clear_state() -> None:
+    with state_lock:
+        events.clear()
+        bans.clear()
+        allowlist.clear()
+        alerts.clear()
+    log("state cleared")
+    broadcast()
+
+
+# ---------- HTTP handler -----------------------------------------------------
+class H(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):  # quiet the noisy default access log
+        pass
+
+    def _send(self, status: int, body: str, ctype="text/html; charset=utf-8"):
+        data = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _form(self) -> dict[str, str]:
+        ln = int(self.headers.get("Content-Length", "0") or "0")
+        raw = self.rfile.read(ln).decode() if ln else ""
+        parsed = parse_qs(raw)
+        return {k: v[0] for k, v in parsed.items()}
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/":
+            return self._send(200, render_page())
+        if path == "/partials/ips":
+            return self._send(200, render_ips_panel())
+        if path == "/partials/alerts":
+            return self._send(200, render_alerts_panel())
+        if path == "/partials/live":
+            return self._send(200, render_live_panel())
+        if path == "/api/map-markers":
+            return self._send(200, map_markers_json(), "application/json")
+        if path == "/api/feed":
+            return self._send(200, feed_json(), "application/json")
+        if path == "/partials/bans":
+            return self._send(200, render_bans_panel())
+        if path == "/events":
+            return self._sse()
+        return self._send(404, "not found", "text/plain")
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+
+        if path.startswith("/scenario/"):
+            name = path.split("/", 2)[2]
+            if name == "clear":
+                clear_state()
+                return self._send(204, "")
+            if play_scenario(name):
+                return self._send(204, "")
+            return self._send(404, "unknown scenario", "text/plain")
+
+        if path == "/ban":
+            form = self._form()
+            ip = form.get("ip", "").strip()
+            try:
+                ttl = int(form.get("ttl", "0"))
+            except ValueError:
+                ttl = 0
+            if not ip or ttl <= 0:
+                return self._send(400, "bad ban payload", "text/plain")
+            expires = now() + ttl
+            with state_lock:
+                bans[ip] = expires
+                allowlist.discard(ip)
+            log(f"[STUB] would ban {ip} for {ttl}s (expires {iso(expires)})")
+            broadcast()
+            return self._send(204, "")
+
+        if path == "/unban":
+            form = self._form()
+            ip = form.get("ip", "").strip()
+            with state_lock:
+                bans.pop(ip, None)
+            log(f"[STUB] would unban {ip}")
+            broadcast()
+            return self._send(204, "")
+
+        if path == "/whitelist":
+            form = self._form()
+            ip = form.get("ip", "").strip()
+            with state_lock:
+                allowlist.add(ip)
+                bans.pop(ip, None)
+            log(f"[STUB] would whitelist {ip}")
+            broadcast()
+            return self._send(204, "")
+
+        if path == "/unallow":
+            form = self._form()
+            ip = form.get("ip", "").strip()
+            with state_lock:
+                allowlist.discard(ip)
+            log(f"[STUB] would remove {ip} from allowlist")
+            broadcast()
+            return self._send(204, "")
+
+        return self._send(404, "not found", "text/plain")
+
+    def _sse(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            self.wfile.write(b": connected\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        q: queue.Queue = queue.Queue(maxsize=200)
+        with state_lock:
+            sse_subs.append(q)
+        try:
+            while True:
+                try:
+                    msg = q.get(timeout=30)
+                except queue.Empty:
+                    msg = ": keepalive\n\n"
+                try:
+                    self.wfile.write(msg.encode())
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+        finally:
+            with state_lock:
+                if q in sse_subs:
+                    sse_subs.remove(q)
+
+
+# ---------- bans expiry sweeper ---------------------------------------------
+def ban_sweeper():
+    while True:
+        time.sleep(5)
+        n = now()
+        dirty = False
+        with state_lock:
+            expired = [ip for ip, exp in bans.items() if exp <= n]
+            for ip in expired:
+                bans.pop(ip, None)
+                dirty = True
+        if dirty:
+            log(f"ban expired: {expired}")
+            broadcast()
+
+
+# ---------- main -------------------------------------------------------------
+def main():
+    threading.Thread(target=ban_sweeper, daemon=True).start()
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), H)
+    log(f"serving at http://localhost:{PORT}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log("shutting down")
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
