@@ -33,19 +33,35 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
 
 AUTH_GRAPHQL_URL = _env("AUTH_GRAPHQL_URL", "https://api.tms360.io/")
 
+# Latest JWT seen via a successful authenticated request. Used by the
+# background ipAccessRules sync when no env-level service token is set —
+# means the hydration loop kicks in once *any* operator has signed in.
+_latest_session_jwt: Optional[str] = None
 
-def auth_configured() -> bool:
-    return bool(_env("AUTH_JWT"))
+
+def remember_session_jwt(jwt: str) -> None:
+    global _latest_session_jwt
+    _latest_session_jwt = jwt
+
+
+def _service_jwt() -> Optional[str]:
+    return _env("AUTH_JWT") or _latest_session_jwt
+
+
+def auth_configured(jwt: Optional[str] = None) -> bool:
+    """True if the caller has a usable JWT (either passed explicitly, set as
+    env var, or remembered from a recent operator session)."""
+    return bool(jwt or _service_jwt())
 
 
 class GraphQLError(RuntimeError):
     pass
 
 
-def _post(query: str, variables: dict) -> dict:
-    jwt = _env("AUTH_JWT")
-    if not jwt:
-        raise GraphQLError("AUTH_JWT not set — cannot call tms-auth")
+def _post(query: str, variables: dict, jwt: Optional[str] = None) -> dict:
+    use_jwt = jwt or _service_jwt()
+    if not use_jwt:
+        raise GraphQLError("no JWT — sign in to the dashboard first or set AUTH_JWT")
 
     body = json.dumps({"query": query, "variables": variables}).encode("utf-8")
     req = urllib.request.Request(
@@ -55,7 +71,7 @@ def _post(query: str, variables: dict) -> dict:
         headers={
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "Authorization": f"Bearer {jwt}",
+            "Authorization": f"Bearer {use_jwt}",
         },
     )
     try:
@@ -118,24 +134,24 @@ mutation Remove($id: ID!) {
 """
 
 
-def list_rules(list_type: str) -> list[dict]:
+def list_rules(list_type: str, jwt: Optional[str] = None) -> list[dict]:
     """list_type ∈ {ALLOW, BLOCK, BAN}. Schema names enforced by tms-auth."""
-    data = _post(Q_LIST, {"listType": list_type})
+    data = _post(Q_LIST, {"listType": list_type}, jwt=jwt)
     return data.get("ipAccessRules") or []
 
 
-def add_allow(ip: str, reason: str = "") -> dict:
-    return _post(M_ADD_ALLOW, {"ip": ip, "reason": reason}).get("addIPToAllowlist") or {}
+def add_allow(ip: str, reason: str = "", jwt: Optional[str] = None) -> dict:
+    return _post(M_ADD_ALLOW, {"ip": ip, "reason": reason}, jwt=jwt).get("addIPToAllowlist") or {}
 
 
-def add_block(ip: str, reason: str = "") -> dict:
-    return _post(M_ADD_BLOCK, {"ip": ip, "reason": reason}).get("addIPToBlocklist") or {}
+def add_block(ip: str, reason: str = "", jwt: Optional[str] = None) -> dict:
+    return _post(M_ADD_BLOCK, {"ip": ip, "reason": reason}, jwt=jwt).get("addIPToBlocklist") or {}
 
 
-def ban(ip: str, ttl_seconds: int, reason: str = "") -> dict:
-    return _post(M_BAN, {"ip": ip, "ttl": ttl_seconds, "reason": reason}).get("banIP") or {}
+def ban(ip: str, ttl_seconds: int, reason: str = "", jwt: Optional[str] = None) -> dict:
+    return _post(M_BAN, {"ip": ip, "ttl": ttl_seconds, "reason": reason}, jwt=jwt).get("banIP") or {}
 
 
-def remove_rule(rule_id: str) -> bool:
-    data = _post(M_REMOVE, {"id": rule_id})
+def remove_rule(rule_id: str, jwt: Optional[str] = None) -> bool:
+    data = _post(M_REMOVE, {"id": rule_id}, jwt=jwt)
     return bool(data.get("removeIPRule"))

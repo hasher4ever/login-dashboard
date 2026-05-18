@@ -4,16 +4,23 @@ Live security monitor for TMS360 sign-in attempts. Consumes the
 `auth_events` Kafka topic emitted by `tms-auth` and drives the IP
 allow / block / ban controls through tms-auth's GraphQL API.
 
+## Access
+
+Operators sign in with their TMS360 credentials at `/signin`. The dashboard
+proxies to `auth.tms360.io/api/auth/signin`, checks the returned JWT carries
+`super_admin`, and sets it as an httpOnly session cookie. Every ban/allow/
+block mutation is then performed *with that operator's own JWT* — so the
+tms-auth audit log carries the real identity, not a shared service token.
+
 ## Modes
 
 | Mode | Trigger | What you see |
 |---|---|---|
-| **Live** | `KAFKA_BROKERS` + `AUTH_JWT` set | Real attempts stream in; ban/allow/block buttons hit tms-auth |
-| **Local-only** | `AUTH_JWT` unset | Buttons update in-memory state, no backend call (UI-test mode) |
+| **Live** | `KAFKA_BROKERS` set + operator signed in | Real attempts stream in; ban/allow/block buttons hit tms-auth as the signed-in operator |
+| **Local-only mutations** | No session, no `AUTH_JWT` | Buttons update in-memory state, no backend call (UI-test mode) |
 | **Disconnected** | `KAFKA_BROKERS` unset | No event stream; pair with `ENABLE_SCENARIOS=true` for the canned demos |
 
-The header pill shows which sources are wired (e.g. `LIVE · kafka auth_events`
-`auth wired`).
+The header pills show source state + signed-in operator email.
 
 ## Tabs
 
@@ -51,7 +58,9 @@ get the canned demo buttons.
 | `KAFKA_SASL_USERNAME` | _(unset)_ | (only when SASL) |
 | `KAFKA_SASL_PASSWORD` | _(unset)_ | (only when SASL) |
 | `AUTH_GRAPHQL_URL` | `https://api.tms360.io/` | tms-auth GraphQL endpoint. TMS360 serves GraphQL at `/`, not `/graphql`. |
-| `AUTH_JWT` | _(unset)_ | super_admin JWT. Without this, mutations run local-only. |
+| `AUTH_SIGNIN_URL` | `https://auth.tms360.io/api/auth/signin` | REST signin endpoint. Override only if it moves. |
+| `AUTH_JWT` | _(unset)_ | Optional service token. If set, the rule-sync hydration loop runs even before any operator signs in. Mutations always prefer the signed-in operator's JWT. |
+| `COOKIE_INSECURE` | `false` | Set to `true` only for local `http://` dev so the session cookie is set without the Secure flag. |
 
 ## Auth-service contract (per DEV-660)
 
@@ -111,9 +120,8 @@ back to "unknown location" and everything else still works.
 
 - No alert rules beyond the three already in `main.py` (brute_force,
   cred_stuffing, geo_anomaly). Tuning thresholds happens in code.
-- No user auth on the dashboard itself — gate access at the Railway / network
-  layer. Anyone with the URL can ban IPs (with a valid `AUTH_JWT`).
-- No JWT auto-refresh. Paste a fresh super_admin token when the old one expires.
+- No JWT refresh loop — when a signed-in operator's token expires, they're
+  bounced to /signin and sign in again. No silent re-auth.
 - No persistence on the dashboard side — events are an in-memory ring buffer;
   Kafka is the source of truth, restart pulls fresh.
 
@@ -121,7 +129,8 @@ back to "unknown location" and everything else still works.
 
 | File | Purpose |
 |---|---|
-| `main.py` | HTTP server, SSE, aggregator, alert rules, HTML render |
+| `main.py` | HTTP server, SSE, aggregator, alert rules, HTML render, session gate |
+| `auth_session.py` | TMS360 signin proxy + JWT parsing + cookie helpers |
 | `kafka_consumer.py` | Background thread that ingests `auth_events` |
 | `graphql_client.py` | Minimal client for the 5 ipAccessRules operations |
 | `geo.py` | MMDB lookup + scenario IP overrides |

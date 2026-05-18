@@ -19,15 +19,20 @@ import threading
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from geo import geolocate
 from scenarios import SCENARIOS
 import kafka_consumer
 import graphql_client
+import auth_session
 
 PORT = int(os.environ.get("PORT", "8000"))
 ENABLE_SCENARIOS = os.environ.get("ENABLE_SCENARIOS", "").lower() in ("1", "true", "yes")
+# Set COOKIE_INSECURE=true only when running on plain http:// (local dev). On
+# Railway the default Secure flag is what we want.
+COOKIE_INSECURE = os.environ.get("COOKIE_INSECURE", "").lower() in ("1", "true", "yes")
 BUFFER_SIZE = 1000
 AGG_WINDOW_S = 300         # aggregates view = last 5 minutes
 RULES_REFRESH_S = 30       # how often to re-pull ipAccessRules from tms-auth
@@ -213,10 +218,9 @@ TAB_DEFS = [
 # IP_GEO override table for the RFC5737 mock IPs used by scenarios.py.
 
 
-def _source_banner() -> str:
-    """Header pill describing which data sources are wired up."""
+def _source_banner(session: Optional[dict] = None) -> str:
+    """Header pills: Kafka source state + auth-sync state + signed-in user."""
     k = kafka_consumer.status()
-    auth_ok = graphql_client.auth_configured()
     parts = []
     if kafka_consumer.kafka_configured():
         if k["connected"]:
@@ -226,14 +230,20 @@ def _source_banner() -> str:
             parts.append(f'<span class="tag tag-warn">KAFKA · {html.escape(err)}</span>')
     else:
         parts.append('<span class="tag tag-warn">no KAFKA_BROKERS</span>')
-    if auth_ok:
-        if auth_status["ok"]:
-            parts.append('<span class="tag tag-live">auth wired</span>')
-        else:
-            err = (auth_status["error"] or "syncing…")[:60]
-            parts.append(f'<span class="tag tag-warn">auth · {html.escape(err)}</span>')
+
+    if session:
+        parts.append(
+            f'<span class="tag tag-live">{html.escape(session["email"])}</span>'
+            f'<a class="tag tag-ghost" href="/logout">logout</a>'
+        )
     else:
-        parts.append('<span class="tag tag-warn">no AUTH_JWT</span>')
+        parts.append('<span class="tag tag-warn">not signed in</span>')
+
+    if auth_status["ok"]:
+        parts.append('<span class="tag tag-live">rules synced</span>')
+    elif auth_status["error"]:
+        err = auth_status["error"][:60]
+        parts.append(f'<span class="tag tag-warn">rules · {html.escape(err)}</span>')
     return "".join(parts)
 
 
@@ -250,7 +260,7 @@ def _scenarios_bar() -> str:
   </div>"""
 
 
-def render_page(active: str = "ips") -> str:
+def render_page(session: Optional[dict] = None, active: str = "ips") -> str:
     tabs = []
     for slug, label, _desc in TAB_DEFS:
         cls = "tab active" if slug == active else "tab"
@@ -285,7 +295,7 @@ def render_page(active: str = "ips") -> str:
 <header>
   <div class="title">
     Login Monitor
-    {_source_banner()}
+    {_source_banner(session)}
   </div>
   {_scenarios_bar()}
 </header>
@@ -914,6 +924,8 @@ header {
 }
 .tag-live { background: #14271a; color: #6cdb8c; }
 .tag-warn { background: #3b2a00; color: #ffc14a; }
+.tag-ghost { background: transparent; border: 1px solid #2a3340; color: #889; text-decoration: none; cursor: pointer; }
+.tag-ghost:hover { background: #1c232c; color: #ccd; }
 .subtitle {
   margin-left: 10px; color: #4a5260; font-size: 11px; font-weight: 400;
 }
@@ -1228,7 +1240,69 @@ def _rule_sync_loop() -> None:
         time.sleep(RULES_REFRESH_S)
 
 
+# ---------- signin page ------------------------------------------------------
+SIGNIN_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sign in — Login Monitor</title>
+<style>
+* { box-sizing: border-box; }
+body {
+  margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  background: #0b0d10; color: #e6e6e6; font-size: 13px;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Mono", Menlo, monospace;
+}
+.card {
+  background: #11151a; border: 1px solid #1f2730; border-radius: 6px;
+  padding: 28px 32px; width: 320px;
+}
+h1 { font-size: 15px; font-weight: 600; margin: 0 0 4px 0; }
+.sub { color: #687080; font-size: 12px; margin-bottom: 18px; }
+label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.3px;
+        color: #889; margin: 12px 0 4px 0; }
+input {
+  width: 100%; padding: 8px 10px; background: #0b0d10; color: #e6e6e6;
+  border: 1px solid #2a3340; border-radius: 4px; font-family: inherit; font-size: 13px;
+}
+input:focus { outline: none; border-color: #6cb2ff; }
+button {
+  width: 100%; margin-top: 18px; padding: 9px 12px; background: #1c232c;
+  color: #e6e6e6; border: 1px solid #2a3340; border-radius: 4px;
+  cursor: pointer; font-family: inherit; font-size: 13px;
+}
+button:hover { background: #242c37; border-color: #3a4757; }
+.err { color: #ff8a96; background: rgba(255,138,150,0.06); border: 1px solid #5a262f;
+       padding: 8px 10px; border-radius: 4px; margin-bottom: 12px; font-size: 12px; }
+</style>
+</head>
+<body>
+<form class="card" method="POST" action="/signin">
+  <h1>Login Monitor</h1>
+  <div class="sub">TMS360 security dashboard · super_admin only</div>
+  __ERR__
+  <label for="email">Email</label>
+  <input id="email" type="email" name="email" autocomplete="email" autofocus required>
+  <label for="password">Password</label>
+  <input id="password" type="password" name="password" autocomplete="current-password" required>
+  <button type="submit">Sign in</button>
+</form>
+</body>
+</html>
+"""
+
+
+def render_signin(error: str = "") -> str:
+    err_html = f'<div class="err">{html.escape(error)}</div>' if error else ""
+    return SIGNIN_HTML.replace("__ERR__", err_html)
+
+
 # ---------- HTTP handler -----------------------------------------------------
+# Paths reachable without a session cookie. Everything else 302s to /signin
+# (for HTML) or 401s (for partial/api/SSE) when the cookie is missing/expired.
+PUBLIC_PATHS = frozenset({"/signin", "/logout"})
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quiet the noisy default access log
         pass
@@ -1251,10 +1325,48 @@ class H(BaseHTTPRequestHandler):
         parsed = parse_qs(raw)
         return {k: v[0] for k, v in parsed.items()}
 
+    def _session(self):
+        """Return {jwt, email, exp} for the signed-in operator, or None."""
+        return auth_session.session_from_request_cookies(self.headers.get("Cookie"))
+
+    def _redirect(self, location: str, set_cookie: str = "") -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        if set_cookie:
+            self.send_header("Set-Cookie", set_cookie)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _gate(self, path: str) -> bool:
+        """Return True if the request may proceed. False = already responded."""
+        if path in PUBLIC_PATHS:
+            return True
+        session = self._session()
+        if session:
+            # Remember the JWT so the background hydration loop can use it
+            graphql_client.remember_session_jwt(session["jwt"])
+            return True
+        # Partial/api/SSE callers can't follow a redirect well; 401 cleanly.
+        if path.startswith(("/partials/", "/api/", "/events")):
+            self._send(401, "not signed in", "text/plain")
+            return False
+        self._redirect("/signin")
+        return False
+
     def do_GET(self):
         path = urlparse(self.path).path
+        if not self._gate(path):
+            return
+        if path == "/signin":
+            # Already-signed-in users skip the form
+            if self._session():
+                return self._redirect("/")
+            return self._send(200, render_signin())
+        if path == "/logout":
+            return self._redirect("/signin", set_cookie=auth_session.clear_cookie())
         if path == "/":
-            return self._send(200, render_page())
+            return self._send(200, render_page(self._session()))
         if path == "/partials/ips":
             return self._send(200, render_ips_panel())
         if path == "/partials/alerts":
@@ -1273,6 +1385,28 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if not self._gate(path):
+            return
+
+        if path == "/signin":
+            form = self._form()
+            email = (form.get("email") or "").strip()
+            password = form.get("password") or ""
+            try:
+                jwt, payload = auth_session.signin(email, password)
+            except auth_session.SigninError as e:
+                log(f"[signin] failed for {email!r}: {e}")
+                return self._send(401, render_signin(str(e)))
+            graphql_client.remember_session_jwt(jwt)
+            log(f"[signin] {email}")
+            return self._redirect(
+                "/",
+                set_cookie=auth_session.cookie_for(
+                    jwt,
+                    auth_session.jwt_exp_unix(payload),
+                    secure=not COOKIE_INSECURE,
+                ),
+            )
 
         if path.startswith("/scenario/"):
             if not ENABLE_SCENARIOS:
@@ -1284,6 +1418,11 @@ class H(BaseHTTPRequestHandler):
             if play_scenario(name):
                 return self._send(204, "")
             return self._send(404, "unknown scenario", "text/plain")
+
+        session = self._session()  # gate ensured this is not None
+        op_jwt = session["jwt"]
+        op_email = session["email"]
+        op_reason = f"via security dashboard ({op_email})"
 
         if path == "/ban":
             form = self._form()
@@ -1297,10 +1436,10 @@ class H(BaseHTTPRequestHandler):
             return self._mutate(
                 action="ban",
                 ip=ip,
-                call=lambda: graphql_client.ban(ip, ttl, "via security dashboard"),
+                call=lambda: graphql_client.ban(ip, ttl, op_reason, jwt=op_jwt),
                 local=lambda rule: bans.__setitem__(ip, {
                     "rule_id": (rule or {}).get("id"),
-                    "reason": "via security dashboard",
+                    "reason": op_reason,
                     "expires_at": _to_unix((rule or {}).get("expiresAt") or "") or (now() + ttl),
                 }),
             )
@@ -1308,7 +1447,7 @@ class H(BaseHTTPRequestHandler):
         if path == "/unban":
             form = self._form()
             ip = form.get("ip", "").strip()
-            return self._mutate_remove(ip, bans)
+            return self._mutate_remove(ip, bans, op_jwt)
 
         if path == "/whitelist":
             form = self._form()
@@ -1316,17 +1455,17 @@ class H(BaseHTTPRequestHandler):
             return self._mutate(
                 action="allow",
                 ip=ip,
-                call=lambda: graphql_client.add_allow(ip, "via security dashboard"),
+                call=lambda: graphql_client.add_allow(ip, op_reason, jwt=op_jwt),
                 local=lambda rule: allowlist.__setitem__(ip, {
                     "rule_id": (rule or {}).get("id"),
-                    "reason": "via security dashboard",
+                    "reason": op_reason,
                 }),
             )
 
         if path == "/unallow":
             form = self._form()
             ip = form.get("ip", "").strip()
-            return self._mutate_remove(ip, allowlist)
+            return self._mutate_remove(ip, allowlist, op_jwt)
 
         if path == "/block":
             form = self._form()
@@ -1334,27 +1473,30 @@ class H(BaseHTTPRequestHandler):
             return self._mutate(
                 action="block",
                 ip=ip,
-                call=lambda: graphql_client.add_block(ip, "via security dashboard"),
+                call=lambda: graphql_client.add_block(ip, op_reason, jwt=op_jwt),
                 local=lambda rule: blocklist.__setitem__(ip, {
                     "rule_id": (rule or {}).get("id"),
-                    "reason": "via security dashboard",
+                    "reason": op_reason,
                 }),
             )
 
         if path == "/unblock":
             form = self._form()
             ip = form.get("ip", "").strip()
-            return self._mutate_remove(ip, blocklist)
+            return self._mutate_remove(ip, blocklist, op_jwt)
 
         return self._send(404, "not found", "text/plain")
 
     # ---------- mutation helpers ------------------------------------------
     def _mutate(self, *, action: str, ip: str, call, local) -> None:
-        """Run a GraphQL mutation when configured, else local-only fallback."""
+        """Run a GraphQL mutation. The session's JWT is captured by `call`'s
+        closure; we attempt it whenever a JWT is in scope, otherwise fall back
+        to local-only state (kept for env-var / no-auth dev mode)."""
         if not ip:
             return self._send(400, "missing ip", "text/plain")
         rule = None
-        if graphql_client.auth_configured():
+        sess = self._session()
+        if sess or graphql_client.auth_configured():
             try:
                 rule = call()
             except graphql_client.GraphQLError as e:
@@ -1366,7 +1508,7 @@ class H(BaseHTTPRequestHandler):
         broadcast()
         return self._send(204, "")
 
-    def _mutate_remove(self, ip: str, target: dict) -> None:
+    def _mutate_remove(self, ip: str, target: dict, jwt: str = "") -> None:
         """Remove `ip` from the given local table; call removeIPRule when configured."""
         if not ip:
             return self._send(400, "missing ip", "text/plain")
@@ -1376,9 +1518,9 @@ class H(BaseHTTPRequestHandler):
             # Nothing to do locally; surface 204 so UI doesn't show an error
             return self._send(204, "")
         rule_id = entry.get("rule_id")
-        if rule_id and graphql_client.auth_configured():
+        if rule_id and graphql_client.auth_configured(jwt=jwt):
             try:
-                graphql_client.remove_rule(rule_id)
+                graphql_client.remove_rule(rule_id, jwt=jwt or None)
             except graphql_client.GraphQLError as e:
                 log(f"[remove] graphql error for {ip}: {e}")
                 return self._send(502, f"auth service error: {e}", "text/plain")
