@@ -135,6 +135,48 @@ def email_of(payload: dict) -> str:
 
 # ---------- signin -----------------------------------------------------------
 
+def _classify_signin_error(http_code: int, body_bytes: bytes, retry_after: str) -> SigninError:
+    """Map a tms-auth signin failure into a user-facing SigninError.
+
+    Per DEV-660 (Ravshan), tms-auth signals two policy-level rejections
+    distinctly: ip_blocked (HTTP 403) and ip_banned (HTTP 429). Anything else
+    in 400/401/403 is a credential failure and must NOT leak whether the
+    email exists (no enumeration). 429 without an `ip_banned` code is treated
+    as ip_banned anyway since tms-auth doesn't 429 for any other reason."""
+    text = body_bytes.decode("utf-8", "replace") if body_bytes else ""
+    code = ""
+    try:
+        parsed = json.loads(text) if text else {}
+        if isinstance(parsed, dict):
+            code = (
+                parsed.get("code")
+                or parsed.get("errorCode")
+                or parsed.get("error")
+                or parsed.get("reason")
+                or ""
+            )
+            if isinstance(code, dict):
+                code = code.get("code") or ""
+    except json.JSONDecodeError:
+        pass
+    code_l = (code or "").lower()
+    text_l = text.lower()
+
+    if http_code == 429 or "ip_banned" in code_l or "ip_banned" in text_l:
+        suffix = f" Retry-After: {retry_after}s." if retry_after else ""
+        return SigninError(
+            "This IP is temporarily banned by tms-auth (too many recent failures)."
+            + suffix
+        )
+    if http_code == 403 and ("ip_blocked" in code_l or "ip_blocked" in text_l):
+        return SigninError(
+            "This IP is permanently blocked. Contact a super_admin to lift the block."
+        )
+    if http_code in (400, 401, 403):
+        return SigninError("invalid email or password")
+    return SigninError(f"auth service returned HTTP {http_code}")
+
+
 def signin(email: str, password: str) -> tuple[str, dict]:
     """Returns (jwt, payload). Raises SigninError on bad creds, network
     failure, missing super_admin role, etc."""
@@ -156,10 +198,15 @@ def signin(email: str, password: str) -> tuple[str, dict]:
         with urllib.request.urlopen(req, timeout=15) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as e:
-        # tms-auth returns 401 / 403 for bad creds — surface a clean message
-        if e.code in (400, 401, 403):
-            raise SigninError("invalid email or password") from e
-        raise SigninError(f"auth service returned HTTP {e.code}") from e
+        # tms-auth signals policy-level rejections distinctly per DEV-660:
+        # 403 ip_blocked, 429 ip_banned — surface them with their real cause.
+        err_body = b""
+        try:
+            err_body = e.read()
+        except Exception:  # noqa: BLE001
+            pass
+        retry_after = (e.headers.get("Retry-After") or "") if e.headers else ""
+        raise _classify_signin_error(e.code, err_body, retry_after) from e
     except urllib.error.URLError as e:
         raise SigninError(f"auth service unreachable: {e.reason}") from e
 
