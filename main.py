@@ -1329,6 +1329,15 @@ class H(BaseHTTPRequestHandler):
         """Return {jwt, email, exp} for the signed-in operator, or None."""
         return auth_session.session_from_request_cookies(self.headers.get("Cookie"))
 
+    def _client_ip(self) -> str:
+        """Originating client IP. Railway / any reverse proxy puts the real
+        client first in X-Forwarded-For; fall back to the socket peer when
+        the header is missing (local dev, direct connections)."""
+        fwd = self.headers.get("X-Forwarded-For") or ""
+        if fwd:
+            return fwd.split(",")[0].strip()
+        return self.client_address[0] if self.client_address else ""
+
     def _redirect(self, location: str, set_cookie: str = "") -> None:
         self.send_response(302)
         self.send_header("Location", location)
@@ -1389,16 +1398,40 @@ class H(BaseHTTPRequestHandler):
             return
 
         if path == "/signin":
+            client_ip = self._client_ip()
+            wait = auth_session.check_signin_rate(client_ip)
+            if wait > 0:
+                log(f"[signin] rate-limited {client_ip} ({wait}s remaining)")
+                msg = (
+                    f"Too many sign-in attempts from your IP. "
+                    f"Try again in {wait} seconds."
+                )
+                body = render_signin(msg).encode()
+                self.send_response(429)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Retry-After", str(wait))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+            # Stamp BEFORE the auth round-trip so a slow tms-auth can't let a
+            # concurrent second request slip past the gate.
+            auth_session.record_signin_attempt(client_ip)
+
             form = self._form()
             email = (form.get("email") or "").strip()
             password = form.get("password") or ""
             try:
                 jwt, payload = auth_session.signin(email, password)
             except auth_session.SigninError as e:
-                log(f"[signin] failed for {email!r}: {e}")
+                log(f"[signin] failed for {email!r} from {client_ip}: {e}")
                 return self._send(401, render_signin(str(e)))
             graphql_client.remember_session_jwt(jwt)
-            log(f"[signin] {email}")
+            log(f"[signin] {email} from {client_ip}")
             return self._redirect(
                 "/",
                 set_cookie=auth_session.cookie_for(

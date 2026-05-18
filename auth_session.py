@@ -18,6 +18,7 @@ carry super_admin.
 import base64
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -26,6 +27,46 @@ from typing import Optional
 
 AUTH_SIGNIN_URL = os.environ.get("AUTH_SIGNIN_URL", "https://auth.tms360.io/api/auth/signin")
 COOKIE_NAME = "dashboard_session"
+
+# Hard per-IP rate limit for the signin endpoint. The dashboard is itself a
+# super-admin gate, so brute force here is the same risk class as brute force
+# against the office app — we throttle aggressively. tms-auth has its own
+# upstream limits; this is the dashboard's own door, not a replacement for
+# them. Set very long deliberately; legitimate operators sign in maybe twice
+# a day, attackers sign in many times a second.
+SIGNIN_RATE_LIMIT_S = 60
+_rl_lock = threading.Lock()
+_rl_last_attempt: dict[str, float] = {}
+
+
+def check_signin_rate(ip: str) -> int:
+    """Return 0 if a signin attempt from `ip` is allowed right now, else the
+    number of seconds the caller must wait. Empty ip = no limit (defensive —
+    rather than failing closed for an edge case we can't classify)."""
+    if not ip:
+        return 0
+    n = time.time()
+    with _rl_lock:
+        # Lazy prune — keep the table bounded even under sustained traffic.
+        threshold = n - SIGNIN_RATE_LIMIT_S * 5
+        for k in [k for k, v in _rl_last_attempt.items() if v < threshold]:
+            _rl_last_attempt.pop(k, None)
+        last = _rl_last_attempt.get(ip, 0.0)
+    elapsed = n - last
+    if elapsed >= SIGNIN_RATE_LIMIT_S:
+        return 0
+    # ceil(remaining) so the user-facing countdown never says "0 seconds"
+    return int(SIGNIN_RATE_LIMIT_S - elapsed) + 1
+
+
+def record_signin_attempt(ip: str) -> None:
+    """Stamp the rate-limit clock for `ip`. Call BEFORE the network round-trip
+    to tms-auth so a slow auth response can't leak a concurrent second
+    attempt past the gate."""
+    if not ip:
+        return
+    with _rl_lock:
+        _rl_last_attempt[ip] = time.time()
 
 
 class SigninError(RuntimeError):
