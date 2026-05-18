@@ -36,10 +36,19 @@ caller treats the dashboard as prototype/disconnected.
 """
 
 import json
+import logging
 import os
 import threading
 import time
 from typing import Callable, Optional
+
+# Silence kafka-python's chatty internal loggers — Railway's deployment log
+# rate limit is ~100 msgs/sec and the library's INFO/DEBUG level happily
+# floods past that during reconnects.
+logging.getLogger("kafka").setLevel(logging.WARNING)
+logging.getLogger("kafka.conn").setLevel(logging.WARNING)
+logging.getLogger("kafka.coordinator").setLevel(logging.WARNING)
+logging.getLogger("kafka.client").setLevel(logging.WARNING)
 
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -106,9 +115,10 @@ def _build_consumer():
         enable_auto_commit=True,
         value_deserializer=lambda b: json.loads(b.decode("utf-8")) if b else None,
         security_protocol=sec,
-        consumer_timeout_ms=0,
-        # Don't sit on the offset if the dashboard restarts during an attack —
-        # we want fresh events on the screen, not a replay of yesterday.
+        # Default consumer_timeout_ms is float('inf') = block forever on empty
+        # topic. We deliberately DO NOT override this: setting it to 0 makes
+        # the iterator non-blocking and the outer reconnect loop tight-spins,
+        # spamming Railway's log rate limit (~100 msg/sec).
         client_id="login-dashboard",
     )
     if sec.startswith("SASL"):
@@ -143,6 +153,12 @@ def _consume_loop(on_event: Callable[[dict], None]) -> None:
                     )
                 except Exception as e:  # noqa: BLE001 — keep the loop alive on bad payloads
                     print(f"[kafka] bad message dropped: {e}", flush=True)
+            # Defensive: if the iterator exits without raising (shouldn't
+            # happen with the default infinite timeout, but guard anyway so
+            # we can never tight-loop), sleep before reconnecting.
+            _set(connected=False, last_error="iterator returned cleanly")
+            print("[kafka] iterator exited cleanly — pausing 5s before reconnect", flush=True)
+            time.sleep(5)
         except Exception as e:  # noqa: BLE001
             _set(connected=False, last_error=str(e))
             print(f"[kafka] disconnected: {e} — retry in {backoff:.0f}s", flush=True)
