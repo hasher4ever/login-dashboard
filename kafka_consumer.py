@@ -147,9 +147,21 @@ def _consume_loop(on_event: Callable[[dict], None]) -> None:
                         continue
                     ev = _adapt(payload)
                     on_event(ev)
+                    seen_before = status()["messages_seen"]
                     _set(
                         last_message_at=time.time(),
-                        messages_seen=status()["messages_seen"] + 1,
+                        messages_seen=seen_before + 1,
+                    )
+                    # Per-event log so "did anything flow through" is answerable
+                    # without an in-browser test. Compact; success/failure +
+                    # email + ip is enough for visual scanning. The first
+                    # message gets an extra prefix so the "wiring works" moment
+                    # is unmistakable in the log stream.
+                    verdict = "OK" if ev["success"] else f"FAIL/{ev.get('failure_reason') or 'unknown'}"
+                    prefix = "[kafka] first event! " if seen_before == 0 else "[kafka] ingest "
+                    print(
+                        f"{prefix}{verdict} email={ev['username']!r} ip={ev['ip']}",
+                        flush=True,
                     )
                 except Exception as e:  # noqa: BLE001 — keep the loop alive on bad payloads
                     print(f"[kafka] bad message dropped: {e}", flush=True)
