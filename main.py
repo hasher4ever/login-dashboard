@@ -1228,15 +1228,32 @@ def hydrate_rules_from_auth() -> tuple[bool, str]:
 
 
 def _rule_sync_loop() -> None:
+    """Pull ipAccessRules every RULES_REFRESH_S seconds. Short-polls every 5s
+    while no JWT is available (e.g., fresh boot, no env AUTH_JWT, nobody
+    signed in yet) and switches to the normal interval once an operator has
+    signed in. Logs only on state transitions so the line doesn't spam every
+    tick of the no-JWT loop."""
+    last_log_state: Optional[str] = None  # "no_jwt", "ok", or last error msg
     while True:
+        if not graphql_client.auth_configured():
+            if last_log_state != "no_jwt":
+                log("rule sync waiting — no JWT yet (will kick in on first signin)")
+                last_log_state = "no_jwt"
+            time.sleep(5)
+            continue
         ok, err = hydrate_rules_from_auth()
         auth_status["last_refresh"] = now()
         auth_status["ok"] = ok
         auth_status["error"] = "" if ok else err
-        if not ok:
-            log(f"rule sync failed: {err}")
-        else:
+        if ok:
+            if last_log_state != "ok":
+                log("rule sync ok — hydrating Bans/Allowlist/Blocklist from tms-auth")
+                last_log_state = "ok"
             broadcast()
+        else:
+            if last_log_state != err:
+                log(f"rule sync failed: {err}")
+                last_log_state = err
         time.sleep(RULES_REFRESH_S)
 
 
@@ -1622,10 +1639,10 @@ def main():
 
     threading.Thread(target=ban_sweeper, daemon=True).start()
     kafka_consumer.start(ingest_event)
-    if graphql_client.auth_configured():
-        threading.Thread(target=_rule_sync_loop, daemon=True, name="rule-sync").start()
-    else:
-        log("rule-sync disabled — AUTH_JWT not set; ban/allow/block buttons run local-only")
+    # Always start rule-sync — it self-gates on JWT availability and short-polls
+    # until an operator signs in. This way the Bans tab hydrates as soon as the
+    # first signin happens, instead of staying empty until a process restart.
+    threading.Thread(target=_rule_sync_loop, daemon=True, name="rule-sync").start()
 
     server = ThreadingHTTPServer(("0.0.0.0", PORT), H)
     log(f"serving at http://localhost:{PORT}")
