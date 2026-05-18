@@ -1,14 +1,22 @@
 FROM python:3.12-slim
 WORKDIR /app
 
-# Tools needed by the geo-data download step (DB-IP City Lite, CC-BY-4.0).
+# Build-time:
+#   - curl + ca-certificates: geo-data download (DB-IP City Lite, CC-BY-4.0)
+#   - gcc + libsnappy-dev + python3-dev: building the python-snappy C extension
+#     which kafka-python loads on demand to decompress auth_events batches
+# Runtime: libsnappy1v5 stays; build tools are removed to keep the image small.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends curl ca-certificates \
+  && apt-get install -y --no-install-recommends \
+       curl ca-certificates \
+       libsnappy1v5 libsnappy-dev gcc python3-dev \
   && rm -rf /var/lib/apt/lists/*
 
 # Install deps first so cache survives source edits.
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+  && apt-get purge -y --auto-remove libsnappy-dev gcc python3-dev \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY . .
 

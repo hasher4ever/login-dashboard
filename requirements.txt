@@ -1,2 +1,6 @@
 maxminddb>=2.6.0
 kafka-python>=2.0.2
+# tms-auth's Kafka producer compresses with snappy; kafka-python imports the
+# `snappy` module on demand. python-snappy provides it. Needs libsnappy-dev
+# at build time (see Dockerfile).
+python-snappy>=0.7.0
