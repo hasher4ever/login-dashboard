@@ -1,0 +1,160 @@
+"""
+Kafka consumer for the auth_events topic published by tms-auth.
+
+Ravshan's payload (per DEV-660 delivery):
+    {
+        "attempt_id": str,
+        "timestamp": str (ISO-8601),
+        "success": bool,
+        "email": str | null,
+        "user_id": str | null,
+        "company_id": str | null,
+        "ip": str,
+        "user_agent": str,
+        "client_type": str,
+        "failure_reason": str | null,
+    }
+
+We adapt this into the dashboard's internal event shape (which predates the
+auth contract) and hand it to ingest_event(). Adapter rules:
+- email -> username (dashboard column is labelled "user"; email is fine)
+- timestamp ignored — ingest_event() stamps ts = now() so the live feed
+  shows wall-clock arrival, which is what an SOC viewer wants. Original
+  source timestamp is preserved in `source_ts` for forensics.
+
+Configuration (env vars, all optional — absence = "no live mode"):
+    KAFKA_BROKERS              comma-separated bootstrap servers
+    KAFKA_TOPIC                default "auth_events"
+    KAFKA_GROUP_ID             default "login-dashboard"
+    KAFKA_SECURITY_PROTOCOL    PLAINTEXT (default) | SASL_PLAINTEXT | SASL_SSL
+    KAFKA_SASL_MECHANISM       PLAIN | SCRAM-SHA-256 | SCRAM-SHA-512
+    KAFKA_SASL_USERNAME
+    KAFKA_SASL_PASSWORD
+
+If KAFKA_BROKERS is unset the consumer is a no-op and start() returns False —
+caller treats the dashboard as prototype/disconnected.
+"""
+
+import json
+import os
+import threading
+import time
+from typing import Callable, Optional
+
+
+def _env(name: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.environ.get(name)
+    return v if v not in (None, "") else default
+
+
+def kafka_configured() -> bool:
+    return bool(_env("KAFKA_BROKERS"))
+
+
+# Public health bits — main.py reads these for the status banner.
+_status_lock = threading.Lock()
+_status: dict = {
+    "connected": False,
+    "broker": _env("KAFKA_BROKERS", ""),
+    "topic": _env("KAFKA_TOPIC", "auth_events"),
+    "last_error": "",
+    "last_message_at": 0.0,
+    "messages_seen": 0,
+}
+
+
+def status() -> dict:
+    with _status_lock:
+        return dict(_status)
+
+
+def _set(**kw) -> None:
+    with _status_lock:
+        _status.update(kw)
+
+
+def _adapt(payload: dict) -> dict:
+    """Map Ravshan's payload into the dashboard's event shape."""
+    return {
+        "success": bool(payload.get("success")),
+        "ip": payload.get("ip") or "",
+        "username": payload.get("email") or "(unknown)",
+        "user_agent": payload.get("user_agent") or "",
+        "failure_reason": payload.get("failure_reason"),
+        # Extra fields kept on the event so future panels can use them.
+        "source_ts": payload.get("timestamp"),
+        "user_id": payload.get("user_id"),
+        "company_id": payload.get("company_id"),
+        "client_type": payload.get("client_type"),
+        "attempt_id": payload.get("attempt_id"),
+    }
+
+
+def _build_consumer():
+    """Lazy import — kafka-python is optional if you're running locally with mocks."""
+    from kafka import KafkaConsumer  # type: ignore
+
+    brokers = _env("KAFKA_BROKERS")
+    topic = _env("KAFKA_TOPIC", "auth_events")
+    group_id = _env("KAFKA_GROUP_ID", "login-dashboard")
+    sec = _env("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
+
+    kw = dict(
+        bootstrap_servers=[b.strip() for b in brokers.split(",") if b.strip()],
+        group_id=group_id,
+        auto_offset_reset="latest",
+        enable_auto_commit=True,
+        value_deserializer=lambda b: json.loads(b.decode("utf-8")) if b else None,
+        security_protocol=sec,
+        consumer_timeout_ms=0,
+        # Don't sit on the offset if the dashboard restarts during an attack —
+        # we want fresh events on the screen, not a replay of yesterday.
+        client_id="login-dashboard",
+    )
+    if sec.startswith("SASL"):
+        kw["sasl_mechanism"] = _env("KAFKA_SASL_MECHANISM", "PLAIN")
+        kw["sasl_plain_username"] = _env("KAFKA_SASL_USERNAME") or ""
+        kw["sasl_plain_password"] = _env("KAFKA_SASL_PASSWORD") or ""
+    return KafkaConsumer(topic, **kw)
+
+
+def _consume_loop(on_event: Callable[[dict], None]) -> None:
+    """Run forever — reconnect on any error after a short backoff."""
+    backoff = 1.0
+    while True:
+        try:
+            consumer = _build_consumer()
+            _set(connected=True, last_error="")
+            print(
+                f"[kafka] connected — brokers={_env('KAFKA_BROKERS')} topic={_env('KAFKA_TOPIC', 'auth_events')}",
+                flush=True,
+            )
+            backoff = 1.0
+            for msg in consumer:
+                try:
+                    payload = msg.value
+                    if not isinstance(payload, dict):
+                        continue
+                    ev = _adapt(payload)
+                    on_event(ev)
+                    _set(
+                        last_message_at=time.time(),
+                        messages_seen=status()["messages_seen"] + 1,
+                    )
+                except Exception as e:  # noqa: BLE001 — keep the loop alive on bad payloads
+                    print(f"[kafka] bad message dropped: {e}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            _set(connected=False, last_error=str(e))
+            print(f"[kafka] disconnected: {e} — retry in {backoff:.0f}s", flush=True)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+
+
+def start(on_event: Callable[[dict], None]) -> bool:
+    """Spawn the consumer thread. Returns False if no broker is configured."""
+    if not kafka_configured():
+        print("[kafka] KAFKA_BROKERS not set — dashboard runs in disconnected mode", flush=True)
+        return False
+    t = threading.Thread(target=_consume_loop, args=(on_event,), daemon=True, name="kafka-consumer")
+    t.start()
+    return True

@@ -1,9 +1,13 @@
 """
-login-dashboard — prototype.
+login-dashboard — live monitor for TMS360 sign-in attempts.
 
-Live monitor for TMS360 signin attempts. Currently fed by mock scenarios from
-scenarios.py — no auth integration. Run with `python3 main.py`, open
-http://localhost:8000.
+Data sources, both optional:
+- **Kafka** topic `auth_events` (per DEV-660). Set KAFKA_BROKERS to enable.
+- **GraphQL** ipAccessRules + ban/allow/block mutations on tms-auth. Set
+  AUTH_JWT (and AUTH_GRAPHQL_URL if non-default) to enable.
+
+With neither configured the dashboard runs in disconnected mode: the
+ENABLE_SCENARIOS=true flag exposes the canned scenario buttons for demo.
 """
 
 import html
@@ -19,10 +23,14 @@ from urllib.parse import parse_qs, urlparse
 
 from geo import geolocate
 from scenarios import SCENARIOS
+import kafka_consumer
+import graphql_client
 
 PORT = int(os.environ.get("PORT", "8000"))
+ENABLE_SCENARIOS = os.environ.get("ENABLE_SCENARIOS", "").lower() in ("1", "true", "yes")
 BUFFER_SIZE = 1000
 AGG_WINDOW_S = 300         # aggregates view = last 5 minutes
+RULES_REFRESH_S = 30       # how often to re-pull ipAccessRules from tms-auth
 ALERT_WINDOW_S = {
     "brute_force": 30,
     "cred_stuffing": 60,
@@ -33,10 +41,14 @@ ALERT_TTL_S = 120          # alerts hang around 2 minutes after firing
 # ---------- mutable state (guarded by lock) ----------------------------------
 state_lock = threading.Lock()
 events: deque = deque(maxlen=BUFFER_SIZE)
-bans: dict[str, float] = {}        # ip -> unix-ts when ban expires
-allowlist: set[str] = set()
+# Per-IP rule registries. Value carries `rule_id` (server-issued, needed for
+# removeIPRule) plus `reason` and (for bans) `expires_at` unix-ts.
+bans: dict[str, dict] = {}
+allowlist: dict[str, dict] = {}
+blocklist: dict[str, dict] = {}
 alerts: list[dict] = []            # {at, kind, key, detail}
 sse_subs: list[queue.Queue] = []
+auth_status: dict = {"last_refresh": 0.0, "ok": False, "error": ""}
 
 
 # ---------- helpers ----------------------------------------------------------
@@ -148,12 +160,24 @@ def _upsert_alert(kind: str, key: str, detail: str) -> None:
 
 
 # ---------- aggregation for the table ---------------------------------------
+def _classify(ip: str, ban_map: dict, allow: dict, block: dict, n: float) -> tuple[str, str]:
+    """Apply Ravshan's precedence: allow > block > ban > clean."""
+    if ip in allow:
+        return "allowlist", "Allow-listed"
+    if ip in block:
+        return "blocklist", "Blocked"
+    if ip in ban_map and ban_map[ip]["expires_at"] > n:
+        return "banned", f"Banned until {iso(ban_map[ip]['expires_at'])}"
+    return "clean", ""
+
+
 def aggregates_snapshot() -> list[dict]:
     n = now()
     with state_lock:
         recent = [e for e in events if n - e["ts"] <= AGG_WINDOW_S]
         ban_map = dict(bans)
-        allow = set(allowlist)
+        allow = dict(allowlist)
+        block = dict(blocklist)
     by_ip: dict[str, dict] = {}
     for e in recent:
         row = by_ip.setdefault(e["ip"], {
@@ -171,16 +195,7 @@ def aggregates_snapshot() -> list[dict]:
     rows = list(by_ip.values())
     rows.sort(key=lambda r: (r["fail"], r["last_ts"]), reverse=True)
     for r in rows:
-        ip = r["ip"]
-        if ip in allow:
-            r["status"] = "allowlist"
-            r["status_label"] = "Allow-listed"
-        elif ip in ban_map and ban_map[ip] > n:
-            r["status"] = "banned"
-            r["status_label"] = f"Banned until {iso(ban_map[ip])}"
-        else:
-            r["status"] = "clean"
-            r["status_label"] = ""
+        r["status"], r["status_label"] = _classify(r["ip"], ban_map, allow, block, n)
     return rows
 
 
@@ -196,6 +211,43 @@ TAB_DEFS = [
 
 # Geo lookup lives in geo.py — MaxMind GeoLite2-City offline MMDB with an
 # IP_GEO override table for the RFC5737 mock IPs used by scenarios.py.
+
+
+def _source_banner() -> str:
+    """Header pill describing which data sources are wired up."""
+    k = kafka_consumer.status()
+    auth_ok = graphql_client.auth_configured()
+    parts = []
+    if kafka_consumer.kafka_configured():
+        if k["connected"]:
+            parts.append(f'<span class="tag tag-live">LIVE · kafka {html.escape(k["topic"])}</span>')
+        else:
+            err = (k["last_error"] or "connecting…")[:60]
+            parts.append(f'<span class="tag tag-warn">KAFKA · {html.escape(err)}</span>')
+    else:
+        parts.append('<span class="tag tag-warn">no KAFKA_BROKERS</span>')
+    if auth_ok:
+        if auth_status["ok"]:
+            parts.append('<span class="tag tag-live">auth wired</span>')
+        else:
+            err = (auth_status["error"] or "syncing…")[:60]
+            parts.append(f'<span class="tag tag-warn">auth · {html.escape(err)}</span>')
+    else:
+        parts.append('<span class="tag tag-warn">no AUTH_JWT</span>')
+    return "".join(parts)
+
+
+def _scenarios_bar() -> str:
+    if not ENABLE_SCENARIOS:
+        return ""
+    return """
+  <div class="scenarios">
+    <button hx-post="/scenario/steady_state"  hx-swap="none">▶ steady_state</button>
+    <button hx-post="/scenario/brute_force"   hx-swap="none" class="danger">▶ brute_force</button>
+    <button hx-post="/scenario/cred_stuffing" hx-swap="none" class="danger">▶ cred_stuffing</button>
+    <button hx-post="/scenario/geo_anomaly"   hx-swap="none" class="warn">▶ geo_anomaly</button>
+    <button hx-post="/scenario/clear"         hx-swap="none" class="ghost">⨯ clear</button>
+  </div>"""
 
 
 def render_page(active: str = "ips") -> str:
@@ -222,7 +274,7 @@ def render_page(active: str = "ips") -> str:
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Login Monitor (PROTOTYPE)</title>
+<title>Login Monitor — TMS360</title>
 <script src="https://unpkg.com/htmx.org@2.0.3"></script>
 <script src="https://unpkg.com/htmx-ext-sse@2.2.2"></script>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
@@ -233,16 +285,9 @@ def render_page(active: str = "ips") -> str:
 <header>
   <div class="title">
     Login Monitor
-    <span class="tag">PROTOTYPE — mock data</span>
-    <span class="subtitle">stdlib + HTMX + SSE · localhost · stub actions only</span>
+    {_source_banner()}
   </div>
-  <div class="scenarios">
-    <button hx-post="/scenario/steady_state"  hx-swap="none">▶ steady_state</button>
-    <button hx-post="/scenario/brute_force"   hx-swap="none" class="danger">▶ brute_force</button>
-    <button hx-post="/scenario/cred_stuffing" hx-swap="none" class="danger">▶ cred_stuffing</button>
-    <button hx-post="/scenario/geo_anomaly"   hx-swap="none" class="warn">▶ geo_anomaly</button>
-    <button hx-post="/scenario/clear"         hx-swap="none" class="ghost">⨯ clear</button>
-  </div>
+  {_scenarios_bar()}
 </header>
 
 <nav class="tabs">{tab_bar}</nav>
@@ -356,7 +401,8 @@ def map_markers_json() -> str:
     with state_lock:
         recent = [e for e in events if n - e["ts"] <= AGG_WINDOW_S]
         ban_map = dict(bans)
-        allow = set(allowlist)
+        allow = dict(allowlist)
+        block = dict(blocklist)
     by_ip: dict[str, dict] = {}
     for e in recent:
         row = by_ip.setdefault(e["ip"], {"ok": 0, "fail": 0, "last_user": "", "last_ts": 0})
@@ -372,7 +418,9 @@ def map_markers_json() -> str:
         lat, lng, label = geolocate(ip)
         if ip in allow:
             color, status = "#6cdb8c", "allowlisted"
-        elif ip in ban_map and ban_map[ip] > n:
+        elif ip in block:
+            color, status = "#ff4d63", "blocked"
+        elif ip in ban_map and ban_map[ip]["expires_at"] > n:
             color, status = "#ff4d63", "banned"
         elif row["fail"] >= 5:
             color, status = "#ff8a96", "hot"
@@ -391,18 +439,25 @@ def map_markers_json() -> str:
 def render_bans_panel() -> str:
     n = now()
     with state_lock:
-        cur_bans = [(ip, exp) for ip, exp in bans.items() if exp > n]
-        cur_allow = list(allowlist)
-    cur_bans.sort(key=lambda b: b[1])
-    cur_allow.sort()
+        cur_bans = [(ip, entry) for ip, entry in bans.items() if entry["expires_at"] > n]
+        cur_allow = list(allowlist.items())
+        cur_block = list(blocklist.items())
+    cur_bans.sort(key=lambda b: b[1]["expires_at"])
+    cur_allow.sort(key=lambda x: x[0])
+    cur_block.sort(key=lambda x: x[0])
     inner = f"""
 <section class="panel">
-  <h2>Banned IPs <span class="muted">({len(cur_bans)} active)</span></h2>
+  <h2>Banned IPs <span class="muted">({len(cur_bans)} active · auto-expire)</span></h2>
   {_render_bans_table(cur_bans, n)}
 </section>
 
 <section class="panel">
-  <h2>Allowlisted IPs <span class="muted">({len(cur_allow)} entries)</span></h2>
+  <h2>Blocklist <span class="muted">({len(cur_block)} entries · permanent)</span></h2>
+  {_render_block_table(cur_block)}
+</section>
+
+<section class="panel">
+  <h2>Allowlist <span class="muted">({len(cur_allow)} entries · beats everything)</span></h2>
   {_render_allow_table(cur_allow)}
 </section>"""
     return _wrap("bans", inner)
@@ -445,16 +500,28 @@ def _render_action_cell(r: dict) -> str:
           <button class="ghost">Unban</button>
         </form>"""
     if r["status"] == "allowlist":
-        return f"""<span class="muted">on allowlist</span>"""
+        return f"""<form hx-post="/unallow" hx-swap="none" class="inline">
+          <input type="hidden" name="ip" value="{ip}">
+          <button class="ghost">Remove from allow</button>
+        </form>"""
+    if r["status"] == "blocklist":
+        return f"""<form hx-post="/unblock" hx-swap="none" class="inline">
+          <input type="hidden" name="ip" value="{ip}">
+          <button class="ghost">Unblock</button>
+        </form>"""
     return f"""<details class="ban-menu">
-  <summary class="danger">Ban ▾</summary>
+  <summary class="danger">Action ▾</summary>
   <div class="ban-options">
-    {_ban_btn(ip, 900,  "15 min")}
-    {_ban_btn(ip, 3600, "1 hour")}
-    {_ban_btn(ip, 86400,"24 hours")}
+    {_ban_btn(ip, 900,  "Ban 15 min")}
+    {_ban_btn(ip, 3600, "Ban 1 hour")}
+    {_ban_btn(ip, 86400,"Ban 24 hours")}
+    <form hx-post="/block" hx-swap="none" class="inline">
+      <input type="hidden" name="ip" value="{ip}">
+      <button class="danger">Block (permanent)</button>
+    </form>
     <form hx-post="/whitelist" hx-swap="none" class="inline">
       <input type="hidden" name="ip" value="{ip}">
-      <button class="good">Whitelist</button>
+      <button class="good">Allow</button>
     </form>
   </div>
 </details>"""
@@ -505,13 +572,16 @@ def _render_bans_table(cur_bans: list, n: float) -> str:
     if not cur_bans:
         return '<p class="muted">No active bans. Ban an IP from the IPs tab to see it here.</p>'
     body = []
-    for ip, exp in cur_bans:
+    for ip, entry in cur_bans:
+        exp = entry["expires_at"]
         remaining = int(exp - n)
+        reason = entry.get("reason") or ""
         body.append(f"""
 <tr>
   <td class="ip">{html.escape(ip)}</td>
   <td class="muted">{html.escape(geolocate(ip)[2])}</td>
   <td class="ts">until {iso(exp)} <span class="muted">({_fmt_remaining(remaining)})</span></td>
+  <td class="muted">{html.escape(reason)}</td>
   <td class="actions">
     <form hx-post="/unban" hx-swap="none" class="inline">
       <input type="hidden" name="ip" value="{html.escape(ip)}">
@@ -520,7 +590,7 @@ def _render_bans_table(cur_bans: list, n: float) -> str:
   </td>
 </tr>""")
     return f"""<table class="agg">
-<thead><tr><th>IP</th><th>Location</th><th>Expires</th><th></th></tr></thead>
+<thead><tr><th>IP</th><th>Location</th><th>Expires</th><th>Reason</th><th></th></tr></thead>
 <tbody>{''.join(body)}</tbody></table>"""
 
 
@@ -528,11 +598,13 @@ def _render_allow_table(cur_allow: list) -> str:
     if not cur_allow:
         return '<p class="muted">No allowlisted IPs.</p>'
     body = []
-    for ip in cur_allow:
+    for ip, entry in cur_allow:
+        reason = entry.get("reason") or ""
         body.append(f"""
 <tr>
   <td class="ip">{html.escape(ip)}</td>
   <td class="muted">{html.escape(geolocate(ip)[2])}</td>
+  <td class="muted">{html.escape(reason)}</td>
   <td class="actions">
     <form hx-post="/unallow" hx-swap="none" class="inline">
       <input type="hidden" name="ip" value="{html.escape(ip)}">
@@ -541,7 +613,30 @@ def _render_allow_table(cur_allow: list) -> str:
   </td>
 </tr>""")
     return f"""<table class="agg">
-<thead><tr><th>IP</th><th>Location</th><th></th></tr></thead>
+<thead><tr><th>IP</th><th>Location</th><th>Reason</th><th></th></tr></thead>
+<tbody>{''.join(body)}</tbody></table>"""
+
+
+def _render_block_table(cur_block: list) -> str:
+    if not cur_block:
+        return '<p class="muted">No blocklisted IPs.</p>'
+    body = []
+    for ip, entry in cur_block:
+        reason = entry.get("reason") or ""
+        body.append(f"""
+<tr>
+  <td class="ip">{html.escape(ip)}</td>
+  <td class="muted">{html.escape(geolocate(ip)[2])}</td>
+  <td class="muted">{html.escape(reason)}</td>
+  <td class="actions">
+    <form hx-post="/unblock" hx-swap="none" class="inline">
+      <input type="hidden" name="ip" value="{html.escape(ip)}">
+      <button class="ghost">Unblock</button>
+    </form>
+  </td>
+</tr>""")
+    return f"""<table class="agg">
+<thead><tr><th>IP</th><th>Location</th><th>Reason</th><th></th></tr></thead>
 <tbody>{''.join(body)}</tbody></table>"""
 
 
@@ -813,9 +908,12 @@ header {
 }
 .title { font-weight: 600; font-size: 15px; }
 .tag {
-  margin-left: 10px; background: #3b2a00; color: #ffc14a;
+  margin-left: 8px; background: #1a2027; color: #889;
   padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 500;
+  display: inline-block; vertical-align: middle;
 }
+.tag-live { background: #14271a; color: #6cdb8c; }
+.tag-warn { background: #3b2a00; color: #ffc14a; }
 .subtitle {
   margin-left: 10px; color: #4a5260; font-size: 11px; font-weight: 400;
 }
@@ -1052,13 +1150,82 @@ def _play_thread(name: str) -> None:
 
 
 def clear_state() -> None:
+    """Wipes the live feed buffer + alert ring. IP rules are server state —
+    we do NOT touch them from /scenario/clear; they're refreshed from tms-auth
+    on the next polling tick."""
     with state_lock:
         events.clear()
-        bans.clear()
-        allowlist.clear()
         alerts.clear()
-    log("state cleared")
+    log("event buffer cleared")
     broadcast()
+
+
+# ---------- ip-access rule sync (tms-auth) -----------------------------------
+def _to_unix(iso_str: str) -> float:
+    if not iso_str:
+        return 0.0
+    s = iso_str.replace("Z", "+00:00")
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(s).timestamp()
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _apply_rule_to_local(entry: dict) -> None:
+    """Mutate local state from a GraphQL rule object. Caller holds state_lock."""
+    ip = entry.get("ip")
+    if not ip:
+        return
+    rule_id = entry.get("id")
+    reason = entry.get("reason") or ""
+    list_type = (entry.get("listType") or "").upper()
+    if list_type == "ALLOW":
+        allowlist[ip] = {"rule_id": rule_id, "reason": reason}
+    elif list_type == "BLOCK":
+        blocklist[ip] = {"rule_id": rule_id, "reason": reason}
+    elif list_type == "BAN":
+        bans[ip] = {
+            "rule_id": rule_id,
+            "reason": reason,
+            "expires_at": _to_unix(entry.get("expiresAt") or ""),
+        }
+
+
+def hydrate_rules_from_auth() -> tuple[bool, str]:
+    """Pull all three lists from tms-auth. Returns (ok, error_msg)."""
+    if not graphql_client.auth_configured():
+        return False, "AUTH_JWT not set"
+    try:
+        allow_rules = graphql_client.list_rules("ALLOW")
+        block_rules = graphql_client.list_rules("BLOCK")
+        ban_rules = graphql_client.list_rules("BAN")
+    except graphql_client.GraphQLError as e:
+        return False, str(e)
+    with state_lock:
+        allowlist.clear()
+        blocklist.clear()
+        bans.clear()
+        for r in allow_rules:
+            _apply_rule_to_local(r)
+        for r in block_rules:
+            _apply_rule_to_local(r)
+        for r in ban_rules:
+            _apply_rule_to_local(r)
+    return True, ""
+
+
+def _rule_sync_loop() -> None:
+    while True:
+        ok, err = hydrate_rules_from_auth()
+        auth_status["last_refresh"] = now()
+        auth_status["ok"] = ok
+        auth_status["error"] = "" if ok else err
+        if not ok:
+            log(f"rule sync failed: {err}")
+        else:
+            broadcast()
+        time.sleep(RULES_REFRESH_S)
 
 
 # ---------- HTTP handler -----------------------------------------------------
@@ -1108,6 +1275,8 @@ class H(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         if path.startswith("/scenario/"):
+            if not ENABLE_SCENARIOS:
+                return self._send(404, "scenarios disabled", "text/plain")
             name = path.split("/", 2)[2]
             if name == "clear":
                 clear_state()
@@ -1125,43 +1294,99 @@ class H(BaseHTTPRequestHandler):
                 ttl = 0
             if not ip or ttl <= 0:
                 return self._send(400, "bad ban payload", "text/plain")
-            expires = now() + ttl
-            with state_lock:
-                bans[ip] = expires
-                allowlist.discard(ip)
-            log(f"[STUB] would ban {ip} for {ttl}s (expires {iso(expires)})")
-            broadcast()
-            return self._send(204, "")
+            return self._mutate(
+                action="ban",
+                ip=ip,
+                call=lambda: graphql_client.ban(ip, ttl, "via security dashboard"),
+                local=lambda rule: bans.__setitem__(ip, {
+                    "rule_id": (rule or {}).get("id"),
+                    "reason": "via security dashboard",
+                    "expires_at": _to_unix((rule or {}).get("expiresAt") or "") or (now() + ttl),
+                }),
+            )
 
         if path == "/unban":
             form = self._form()
             ip = form.get("ip", "").strip()
-            with state_lock:
-                bans.pop(ip, None)
-            log(f"[STUB] would unban {ip}")
-            broadcast()
-            return self._send(204, "")
+            return self._mutate_remove(ip, bans)
 
         if path == "/whitelist":
             form = self._form()
             ip = form.get("ip", "").strip()
-            with state_lock:
-                allowlist.add(ip)
-                bans.pop(ip, None)
-            log(f"[STUB] would whitelist {ip}")
-            broadcast()
-            return self._send(204, "")
+            return self._mutate(
+                action="allow",
+                ip=ip,
+                call=lambda: graphql_client.add_allow(ip, "via security dashboard"),
+                local=lambda rule: allowlist.__setitem__(ip, {
+                    "rule_id": (rule or {}).get("id"),
+                    "reason": "via security dashboard",
+                }),
+            )
 
         if path == "/unallow":
             form = self._form()
             ip = form.get("ip", "").strip()
-            with state_lock:
-                allowlist.discard(ip)
-            log(f"[STUB] would remove {ip} from allowlist")
-            broadcast()
-            return self._send(204, "")
+            return self._mutate_remove(ip, allowlist)
+
+        if path == "/block":
+            form = self._form()
+            ip = form.get("ip", "").strip()
+            return self._mutate(
+                action="block",
+                ip=ip,
+                call=lambda: graphql_client.add_block(ip, "via security dashboard"),
+                local=lambda rule: blocklist.__setitem__(ip, {
+                    "rule_id": (rule or {}).get("id"),
+                    "reason": "via security dashboard",
+                }),
+            )
+
+        if path == "/unblock":
+            form = self._form()
+            ip = form.get("ip", "").strip()
+            return self._mutate_remove(ip, blocklist)
 
         return self._send(404, "not found", "text/plain")
+
+    # ---------- mutation helpers ------------------------------------------
+    def _mutate(self, *, action: str, ip: str, call, local) -> None:
+        """Run a GraphQL mutation when configured, else local-only fallback."""
+        if not ip:
+            return self._send(400, "missing ip", "text/plain")
+        rule = None
+        if graphql_client.auth_configured():
+            try:
+                rule = call()
+            except graphql_client.GraphQLError as e:
+                log(f"[{action}] graphql error for {ip}: {e}")
+                return self._send(502, f"auth service error: {e}", "text/plain")
+        with state_lock:
+            local(rule)
+        log(f"[{action}] {ip} (rule_id={(rule or {}).get('id', 'local-only')})")
+        broadcast()
+        return self._send(204, "")
+
+    def _mutate_remove(self, ip: str, target: dict) -> None:
+        """Remove `ip` from the given local table; call removeIPRule when configured."""
+        if not ip:
+            return self._send(400, "missing ip", "text/plain")
+        with state_lock:
+            entry = target.get(ip)
+        if not entry:
+            # Nothing to do locally; surface 204 so UI doesn't show an error
+            return self._send(204, "")
+        rule_id = entry.get("rule_id")
+        if rule_id and graphql_client.auth_configured():
+            try:
+                graphql_client.remove_rule(rule_id)
+            except graphql_client.GraphQLError as e:
+                log(f"[remove] graphql error for {ip}: {e}")
+                return self._send(502, f"auth service error: {e}", "text/plain")
+        with state_lock:
+            target.pop(ip, None)
+        log(f"[remove] {ip} (rule_id={rule_id or 'local-only'})")
+        broadcast()
+        return self._send(204, "")
 
     def _sse(self):
         self.send_response(200)
@@ -1197,12 +1422,14 @@ class H(BaseHTTPRequestHandler):
 
 # ---------- bans expiry sweeper ---------------------------------------------
 def ban_sweeper():
+    """Best-effort local TTL — tms-auth is the source of truth, but we want
+    the UI to drop expired bans without waiting for the next 30s rule sync."""
     while True:
         time.sleep(5)
         n = now()
         dirty = False
         with state_lock:
-            expired = [ip for ip, exp in bans.items() if exp <= n]
+            expired = [ip for ip, entry in bans.items() if entry["expires_at"] <= n]
             for ip in expired:
                 bans.pop(ip, None)
                 dirty = True
@@ -1213,7 +1440,18 @@ def ban_sweeper():
 
 # ---------- main -------------------------------------------------------------
 def main():
+    log(f"login-dashboard starting on :{PORT}")
+    log(f"  ENABLE_SCENARIOS={ENABLE_SCENARIOS}")
+    log(f"  kafka configured: {kafka_consumer.kafka_configured()}")
+    log(f"  auth configured: {graphql_client.auth_configured()}")
+
     threading.Thread(target=ban_sweeper, daemon=True).start()
+    kafka_consumer.start(ingest_event)
+    if graphql_client.auth_configured():
+        threading.Thread(target=_rule_sync_loop, daemon=True, name="rule-sync").start()
+    else:
+        log("rule-sync disabled — AUTH_JWT not set; ban/allow/block buttons run local-only")
+
     server = ThreadingHTTPServer(("0.0.0.0", PORT), H)
     log(f"serving at http://localhost:{PORT}")
     try:

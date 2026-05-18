@@ -1,1 +1,2 @@
 maxminddb>=2.6.0
+kafka-python>=2.0.2
