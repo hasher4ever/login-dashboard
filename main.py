@@ -1159,7 +1159,11 @@ function refreshMarkers() {
         _escape(m.label) + ' · ' + marker._clusterIps.length + (marker._clusterIps.length === 1 ? ' IP' : ' IPs'),
         { direction: 'top', offset: [0, -8] }
       );
-      marker.on('click', function() {
+      marker.on('click', function(e) {
+        // Stop propagation: Leaflet bubbles marker clicks up to the map,
+        // and the map's click handler clears _popupIps — so without this
+        // the highlight would be set then wiped on the same click.
+        L.DomEvent.stopPropagation(e);
         // Toggle: clicking the same cluster again clears the highlight.
         var same = _popupIps.size === marker._clusterIps.length &&
                    marker._clusterIps.every(function(ip) { return _popupIps.has(ip); });
