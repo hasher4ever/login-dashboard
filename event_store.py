@@ -38,7 +38,14 @@ from typing import Optional
 # clickhouse-driver's Client; lazy-imported so the dashboard can boot without
 # it installed (useful for local-only dev when CH isn't configured).
 _client = None
-_client_lock = threading.Lock()
+_client_lock = threading.Lock()   # guards _client (re)creation
+# clickhouse-driver's Client is NOT thread-safe — concurrent .execute() calls
+# from different threads corrupt the socket state and surface as "Simultaneous
+# queries on single connection" / "Bad file descriptor" / mysterious EOFs.
+# Serialize every CH operation through this lock. Throughput is capped at one
+# query at a time, which is fine for our load (one batch insert every 500 ms,
+# panel queries every 5 s).
+_exec_lock = threading.Lock()
 _status = {
     "configured": False,
     "connected": False,
@@ -111,8 +118,12 @@ def _get_client():
                 settings={"use_numpy": False},
             )
             # Force an early auth round-trip so we know connect is good
-            # before the first batch tries to flush.
-            _client.execute("SELECT 1")
+            # before the first batch tries to flush. Held under _exec_lock
+            # for symmetry with every other operation — at this point _client
+            # has just been assigned but no other thread has the reference
+            # yet, so contention is impossible, but the pattern stays uniform.
+            with _exec_lock:
+                _client.execute("SELECT 1")
             _status["configured"] = True
             _status["connected"] = True
             _status["last_error"] = ""
@@ -176,7 +187,8 @@ def ensure_schema() -> bool:
     if client is None:
         return False
     try:
-        client.execute(SCHEMA_DDL)
+        with _exec_lock:
+            client.execute(SCHEMA_DDL)
         print(f"[ch] schema ready — table {TABLE}", flush=True)
         return True
     except Exception as e:  # noqa: BLE001
@@ -252,7 +264,8 @@ def insert_batch(events: list[dict]) -> bool:
         return False
     rows = [_row_from_event(e) for e in events]
     try:
-        client.execute(INSERT_SQL, rows)
+        with _exec_lock:
+            client.execute(INSERT_SQL, rows)
         before = _status["rows_inserted"]
         _status["last_insert_at"] = time.time()
         _status["rows_inserted"] = before + len(rows)
@@ -301,7 +314,8 @@ def query_aggregates(window_s: int) -> list[dict]:
         LIMIT 500
     """
     try:
-        rows = client.execute(sql)
+        with _exec_lock:
+            rows = client.execute(sql)
         _status["last_query_at"] = time.time()
         _status["connected"] = True
         out = []
@@ -340,7 +354,8 @@ def query_recent(limit: int = 100) -> list[dict]:
         LIMIT {int(limit)}
     """
     try:
-        rows = client.execute(sql)
+        with _exec_lock:
+            rows = client.execute(sql)
         _status["last_query_at"] = time.time()
         _status["connected"] = True
         out = []
@@ -369,7 +384,8 @@ def total_rows() -> int:
     if client is None:
         return 0
     try:
-        rows = client.execute(f"SELECT count() FROM {TABLE}")
+        with _exec_lock:
+            rows = client.execute(f"SELECT count() FROM {TABLE}")
         return int(rows[0][0]) if rows else 0
     except Exception as e:  # noqa: BLE001
         _status["last_error"] = str(e)[:200]
