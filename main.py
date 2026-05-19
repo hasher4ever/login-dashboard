@@ -33,14 +33,28 @@ ENABLE_SCENARIOS = os.environ.get("ENABLE_SCENARIOS", "").lower() in ("1", "true
 # Set COOKIE_INSECURE=true only when running on plain http:// (local dev). On
 # Railway the default Secure flag is what we want.
 COOKIE_INSECURE = os.environ.get("COOKIE_INSECURE", "").lower() in ("1", "true", "yes")
-BUFFER_SIZE = 1000
-AGG_WINDOW_S = 300         # aggregates view = last 5 minutes
+BUFFER_SIZE = 10000        # event ring buffer — caps how much history any window can show
 RULES_REFRESH_S = 30       # how often to re-pull ipAccessRules from tms-auth
 ALERT_WINDOW_S = {
     "brute_force": 30,
     "cred_stuffing": 60,
     "geo_anomaly": 300,
 }
+
+# User-facing time-window picker. Cookie `dashboard_window` overrides the
+# default; every snapshot/render reads it per-request so changing the
+# dropdown takes effect on the next refresh tick (no process restart).
+WINDOW_COOKIE = "dashboard_window"
+DEFAULT_WINDOW_S = 300
+WINDOW_PRESETS: list[tuple[int, str]] = [
+    (300, "5 minutes"),
+    (900, "15 minutes"),
+    (3600, "1 hour"),
+    (21600, "6 hours"),
+    (86400, "24 hours"),
+]
+WINDOW_MIN_S = 60
+WINDOW_MAX_S = 86400 * 7   # cap at 7 days; longer would need a real store
 ALERT_TTL_S = 120          # alerts hang around 2 minutes after firing
 
 # ---------- mutable state (guarded by lock) ----------------------------------
@@ -176,10 +190,22 @@ def _classify(ip: str, ban_map: dict, allow: dict, block: dict, n: float) -> tup
     return "clean", ""
 
 
-def aggregates_snapshot() -> list[dict]:
+def fmt_window(seconds: int) -> str:
+    """Render a window length as a human label: '5 minutes', '6 hours', '2 days'."""
+    if seconds < 3600:
+        m = seconds // 60
+        return f"{m} minute{'s' if m != 1 else ''}"
+    if seconds < 86400:
+        h = seconds // 3600
+        return f"{h} hour{'s' if h != 1 else ''}"
+    d = seconds // 86400
+    return f"{d} day{'s' if d != 1 else ''}"
+
+
+def aggregates_snapshot(window_s: int) -> list[dict]:
     n = now()
     with state_lock:
-        recent = [e for e in events if n - e["ts"] <= AGG_WINDOW_S]
+        recent = [e for e in events if n - e["ts"] <= window_s]
         ban_map = dict(bans)
         allow = dict(allowlist)
         block = dict(blocklist)
@@ -260,7 +286,33 @@ def _scenarios_bar() -> str:
   </div>"""
 
 
-def render_page(session: Optional[dict] = None, active: str = "ips") -> str:
+def _window_picker(current: int) -> str:
+    """Compact <select> rendered in the header. Pre-selects whichever preset
+    matches the current cookie value; falls back to showing the literal
+    seconds value if the user has a custom one (set via cookie directly).
+    onChange writes a year-long cookie and reloads so every panel re-renders
+    against the new window in a single tick."""
+    preset_values = {s for s, _ in WINDOW_PRESETS}
+    options = []
+    for s, label in WINDOW_PRESETS:
+        sel = " selected" if s == current else ""
+        options.append(f'<option value="{s}"{sel}>last {label}</option>')
+    if current not in preset_values:
+        options.append(
+            f'<option value="{current}" selected>last {html.escape(fmt_window(current))}</option>'
+        )
+    return (
+        '<select class="window-picker" onchange="setWindow(this.value)">'
+        + "".join(options)
+        + "</select>"
+    )
+
+
+def render_page(
+    session: Optional[dict] = None,
+    window_s: int = DEFAULT_WINDOW_S,
+    active: str = "map",
+) -> str:
     tabs = []
     for slug, label, _desc in TAB_DEFS:
         cls = "tab active" if slug == active else "tab"
@@ -297,14 +349,17 @@ def render_page(session: Optional[dict] = None, active: str = "ips") -> str:
     Login Monitor
     {_source_banner(session)}
   </div>
-  {_scenarios_bar()}
+  <div class="header-controls">
+    {_window_picker(window_s)}
+    {_scenarios_bar()}
+  </div>
 </header>
 
 <nav class="tabs">{tab_bar}</nav>
 
-<main hx-ext="sse" sse-connect="/events">
+<main hx-ext="sse" sse-connect="/events" class="{'show-map' if active == 'map' else ''}">
   <div id="content"
-       hx-get="/partials/{active}"
+       hx-get="/partials/{active if active != 'map' else 'ips'}"
        hx-trigger="load, sse:update, every 5s"
        hx-swap="outerHTML">
     Loading…
@@ -355,11 +410,11 @@ def _wrap(slug: str, inner: str) -> str:
     )
 
 
-def render_ips_panel() -> str:
-    rows = aggregates_snapshot()
+def render_ips_panel(window_s: int = DEFAULT_WINDOW_S) -> str:
+    rows = aggregates_snapshot(window_s)
     inner = f"""
 <section class="panel">
-  <h2>Aggregates by IP <span class="muted">(last {AGG_WINDOW_S // 60} min, sorted by fail count)</span></h2>
+  <h2>Aggregates by IP <span class="muted">(last {fmt_window(window_s)}, sorted by fail count)</span></h2>
   {_render_agg_table(rows, now())}
 </section>"""
     return _wrap("ips", inner)
@@ -405,11 +460,11 @@ def feed_json() -> str:
     return json.dumps({"events": out, "total": total})
 
 
-def map_markers_json() -> str:
+def map_markers_json(window_s: int = DEFAULT_WINDOW_S) -> str:
     """JSON payload for the Map tab. Pure data, no HTML."""
     n = now()
     with state_lock:
-        recent = [e for e in events if n - e["ts"] <= AGG_WINDOW_S]
+        recent = [e for e in events if n - e["ts"] <= window_s]
         ban_map = dict(bans)
         allow = dict(allowlist)
         block = dict(blocklist)
@@ -443,7 +498,10 @@ def map_markers_json() -> str:
             "ok": row["ok"], "fail": row["fail"],
             "user": row["last_user"], "color": color, "status": status,
         })
-    return json.dumps({"markers": markers, "window_min": AGG_WINDOW_S // 60})
+    return json.dumps({
+        "markers": markers,
+        "window_label": fmt_window(window_s),
+    })
 
 
 def render_bans_panel() -> str:
@@ -675,6 +733,17 @@ def _short_ua(ua: str) -> str:
 
 
 MAP_JS = """
+function setWindow(v) {
+  // Year-long cookie so the choice survives reloads. SameSite=Lax matches
+  // the session cookie. Secure is set when we're on https; Railway is
+  // always https in prod, so this is fine.
+  var secure = (location.protocol === 'https:') ? '; Secure' : '';
+  document.cookie = 'dashboard_window=' + encodeURIComponent(v) +
+    '; path=/; max-age=' + (60 * 60 * 24 * 365) +
+    '; SameSite=Lax' + secure;
+  location.reload();
+}
+
 let _mapInstance = null;
 let _markerLayer = null;
 let _tileLayer = null;
@@ -864,7 +933,7 @@ function refreshMarkers() {
       }).bindPopup(_popupHtml(m)).addTo(_markerLayer);
     });
     var stat = document.getElementById('map-stat');
-    if (stat) stat.textContent = '(' + data.markers.length + ' unique IPs · last ' + data.window_min + ' min)';
+    if (stat) stat.textContent = '(' + data.markers.length + ' unique IPs · last ' + data.window_label + ')';
   });
 }
 
@@ -902,6 +971,18 @@ document.body.addEventListener('htmx:sseMessage', function(ev) {
   refreshMarkers();
   refreshSideFeed();
 });
+
+// When the server renders the page with the Map tab already active (default
+// landing), the show-map class is on <main> from the start but Leaflet hasn't
+// been initialized yet — showMap() does that lazily. Find the active button
+// and hand it off so initialization, marker fetch, and side-feed fetch all
+// happen on first paint.
+document.addEventListener('DOMContentLoaded', function() {
+  if (document.querySelector('main').classList.contains('show-map')) {
+    var activeBtn = document.querySelector('nav.tabs .tab.active');
+    if (activeBtn) showMap(activeBtn);
+  }
+});
 """
 
 
@@ -930,6 +1011,14 @@ header {
   margin-left: 10px; color: #4a5260; font-size: 11px; font-weight: 400;
 }
 .scenarios { display: flex; gap: 8px; }
+.header-controls { display: flex; gap: 10px; align-items: center; }
+.window-picker {
+  background: #1c232c; color: #e6e6e6;
+  border: 1px solid #2a3340; border-radius: 4px;
+  padding: 5px 8px; font-family: inherit; font-size: 12px; cursor: pointer;
+}
+.window-picker:hover { background: #242c37; border-color: #3a4757; }
+.window-picker:focus { outline: none; border-color: #6cb2ff; }
 button {
   background: #1c232c; color: #e6e6e6; border: 1px solid #2a3340;
   padding: 5px 12px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 12px;
@@ -1346,6 +1435,20 @@ class H(BaseHTTPRequestHandler):
         """Return {jwt, email, exp} for the signed-in operator, or None."""
         return auth_session.session_from_request_cookies(self.headers.get("Cookie"))
 
+    def _window_s(self) -> int:
+        """Read the user-chosen time window from the dashboard_window cookie.
+        Clamped to [WINDOW_MIN_S, WINDOW_MAX_S]; falls back to DEFAULT_WINDOW_S
+        for missing/garbage values so a bad cookie can't break the UI."""
+        cookies = auth_session.parse_cookie_header(self.headers.get("Cookie"))
+        raw = cookies.get(WINDOW_COOKIE, "")
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_WINDOW_S
+        if n < WINDOW_MIN_S or n > WINDOW_MAX_S:
+            return DEFAULT_WINDOW_S
+        return n
+
     def _client_ip(self) -> str:
         """Originating client IP. Railway / any reverse proxy puts the real
         client first in X-Forwarded-For; fall back to the socket peer when
@@ -1392,15 +1495,15 @@ class H(BaseHTTPRequestHandler):
         if path == "/logout":
             return self._redirect("/signin", set_cookie=auth_session.clear_cookie())
         if path == "/":
-            return self._send(200, render_page(self._session()))
+            return self._send(200, render_page(self._session(), self._window_s()))
         if path == "/partials/ips":
-            return self._send(200, render_ips_panel())
+            return self._send(200, render_ips_panel(self._window_s()))
         if path == "/partials/alerts":
             return self._send(200, render_alerts_panel())
         if path == "/partials/live":
             return self._send(200, render_live_panel())
         if path == "/api/map-markers":
-            return self._send(200, map_markers_json(), "application/json")
+            return self._send(200, map_markers_json(self._window_s()), "application/json")
         if path == "/api/feed":
             return self._send(200, feed_json(), "application/json")
         if path == "/partials/bans":
