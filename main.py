@@ -1105,6 +1105,11 @@ function _ipRowHtml(row) {
   var ipSafe = _escape(row.ip);
   var userSafe = _escape(row.user || '\\u2014');
   var title = ipSafe + ' · ' + userSafe + ' · ' + _escape(row.status);
+  // Single Ban dropdown replaces three side-by-side TTL buttons — the
+  // <select> styles match the previous red button and the native menu
+  // surfaces 15m/1h/24h on click. onchange fires the ban + resets the
+  // placeholder so the same row can be banned repeatedly without a
+  // re-render (Leaflet won't redraw an open popup).
   return (
     '<div class="popup-row" style="border-left:3px solid ' + row.color + ';" title="' + title + '">' +
       '<span class="pr-ip">' + ipSafe + '</span>' +
@@ -1114,10 +1119,13 @@ function _ipRowHtml(row) {
       '</span>' +
       '<span class="pr-user muted">' + userSafe + '</span>' +
       '<span class="pr-actions">' +
-        '<button onclick="event.stopPropagation(); banFromPopup(\\'' + ipSafe + '\\', 900); return false;">15m</button>' +
-        '<button onclick="event.stopPropagation(); banFromPopup(\\'' + ipSafe + '\\', 3600); return false;">1h</button>' +
-        '<button onclick="event.stopPropagation(); banFromPopup(\\'' + ipSafe + '\\', 86400); return false;">24h</button>' +
-        '<button onclick="event.stopPropagation(); whitelistFromPopup(\\'' + ipSafe + '\\'); return false;" class="good">✓</button>' +
+        '<select class="pr-ban" onchange="event.stopPropagation(); if (this.value) { banFromPopup(\\'' + ipSafe + '\\', parseInt(this.value, 10)); this.selectedIndex = 0; }" onclick="event.stopPropagation();">' +
+          '<option value="" selected>Ban ▾</option>' +
+          '<option value="900">15m</option>' +
+          '<option value="3600">1h</option>' +
+          '<option value="86400">24h</option>' +
+        '</select>' +
+        '<button onclick="event.stopPropagation(); whitelistFromPopup(\\'' + ipSafe + '\\'); return false;" class="good">Allow</button>' +
       '</span>' +
     '</div>'
   );
@@ -1641,10 +1649,18 @@ body { overflow: hidden; }  /* page must fit viewport; no scroll */
 .popup-cluster .pr-actions { display: inline-flex; gap: 2px; flex-shrink: 0; }
 .popup-cluster .pr-actions button {
   background: #2a1417; border: 1px solid #5a262f; color: #ff8a96;
-  padding: 1px 5px; border-radius: 3px; font-size: 10px; cursor: pointer;
+  padding: 1px 6px; border-radius: 3px; font-size: 10px; cursor: pointer;
   font-family: inherit; line-height: 1.15;
 }
-.popup-cluster .pr-actions button.good { background: #14271a; border-color: #275a35; color: #6cdb8c; padding: 1px 6px; }
+.popup-cluster .pr-actions button.good { background: #14271a; border-color: #275a35; color: #6cdb8c; }
+.popup-cluster .pr-actions select.pr-ban {
+  background: #2a1417; border: 1px solid #5a262f; color: #ff8a96;
+  padding: 1px 4px; border-radius: 3px; font-size: 10px; cursor: pointer;
+  font-family: inherit; line-height: 1.15;
+  appearance: none; -webkit-appearance: none;
+}
+.popup-cluster .pr-actions select.pr-ban:hover { background: #3a1c20; }
+.popup-cluster .pr-actions select.pr-ban option { background: #11151a; color: #e6e6e6; }
 .popup-cluster .muted { color: #687080; }
 
 .side-feed-panel { overflow: hidden; }
