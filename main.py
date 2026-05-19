@@ -548,27 +548,58 @@ def render_live_panel() -> str:
 
 
 def feed_json(geo_backend: Optional[str] = None) -> str:
-    """JSON payload for the side feed: most recent events, newest first.
+    """JSON payload for the side feed: recent activity rolled up per IP.
 
-    `geo_backend` is unused today (the side-feed doesn't carry a location
-    column) but accepted for symmetry with map_markers_json so the route
-    layer can pass `?geo=` through uniformly."""
-    _ = geo_backend  # reserved for when we surface per-row geo in the feed
-    snap = _recent_events(80)
+    Source rows are the most recent ~200 events. Bucketed by IP, kept
+    sorted by most-recent event so the panel still reads like a "live"
+    feed but a single IP firing repeatedly collapses into one row
+    instead of pushing every other source off-screen. Each row carries
+    its resolved city/country so the operator can scan location at a
+    glance without clicking the map marker."""
+    snap = _recent_events(200)
     if event_store.ch_configured() and event_store.status()["connected"]:
         total = event_store.total_rows()
     else:
         with state_lock:
             total = len(events)
-    out = []
+
+    groups: dict[str, dict] = {}
+    # snap is newest-first — the first event we see for an IP IS its latest.
     for e in snap:
-        out.append({
-            "ts": iso(e["ts"]),
-            "success": e["success"],
-            "ip": e["ip"],
-            "username": e["username"],
-        })
-    return json.dumps({"events": out, "total": total})
+        ip = e["ip"]
+        g = groups.get(ip)
+        if g is None:
+            lat, lng, label = geolocate(ip, backend=geo_backend)
+            groups[ip] = {
+                "ip": ip,
+                "ok": 1 if e["success"] else 0,
+                "fail": 0 if e["success"] else 1,
+                "last_ts": iso(e["ts"]),
+                "last_user": e["username"],
+                "last_success": e["success"],
+                "label": label,
+                "_sort": e["ts"],
+            }
+        else:
+            if e["success"]:
+                g["ok"] += 1
+            else:
+                g["fail"] += 1
+
+    rows = sorted(groups.values(), key=lambda x: x["_sort"], reverse=True)
+    out = [
+        {
+            "ip": g["ip"],
+            "ok": g["ok"],
+            "fail": g["fail"],
+            "ts": g["last_ts"],
+            "last_user": g["last_user"],
+            "last_success": g["last_success"],
+            "label": g["label"],
+        }
+        for g in rows
+    ]
+    return json.dumps({"groups": out, "total": total, "events_scanned": len(snap)})
 
 
 def map_markers_json(window_s: int = DEFAULT_WINDOW_S, geo_backend: Optional[str] = None) -> str:
@@ -585,7 +616,12 @@ def map_markers_json(window_s: int = DEFAULT_WINDOW_S, geo_backend: Optional[str
         block = dict(blocklist)
 
     rows = aggregates_snapshot(window_s)
-    markers = []
+    # Per-IP rows first, then collapse by location (label). IPs that resolve
+    # to the same city share exactly the same (lat, lng) — they'd render as
+    # pixel-perfect-overlapping circles, only the topmost is clickable.
+    # Grouping into one marker per location with a list-of-IPs popup makes
+    # the cluster actionable; the right pane still surfaces each IP.
+    by_label: dict[str, dict] = {}
     for r in rows:
         ip = r["ip"]
         lat, lng, label = geolocate(ip, backend=geo_backend)
@@ -609,10 +645,45 @@ def map_markers_json(window_s: int = DEFAULT_WINDOW_S, geo_backend: Optional[str
             color, status = "#ffc14a", "mixed"
         else:
             color, status = "#6cb2ff", "clean"
-        markers.append({
-            "ip": ip, "lat": lat, "lng": lng, "label": label,
-            "ok": r["ok"], "fail": r["fail"],
+        ip_row = {
+            "ip": ip, "ok": r["ok"], "fail": r["fail"],
             "user": r["last_user"], "color": color, "status": status,
+        }
+        g = by_label.get(label)
+        if g is None:
+            by_label[label] = {
+                "lat": lat, "lng": lng, "label": label,
+                "ips": [ip_row],
+                "ok": r["ok"], "fail": r["fail"],
+            }
+        else:
+            g["ips"].append(ip_row)
+            g["ok"] += r["ok"]
+            g["fail"] += r["fail"]
+
+    # Worst-status wins for the cluster color/status — operator's eye
+    # should land on the riskiest IP in the bucket first. Tiers:
+    #   5 banned/blocked · 4 hot · 3 mixed · 2 unknown · 1 allow · 0 clean
+    # `unknown-location` is ranked ABOVE allow/clean so a grey marker
+    # signals "I have no idea where this is" even when every IP in it
+    # is benign — that's still actionable context for the operator.
+    _TIER = {
+        "banned": 5, "blocked": 5,
+        "hot": 4, "mixed": 3,
+        "unknown-location": 2,
+        "allowlisted": 1, "clean": 0,
+    }
+    markers = []
+    for g in by_label.values():
+        worst = max(g["ips"], key=lambda x: _TIER.get(x["status"], 0))
+        markers.append({
+            "lat": g["lat"], "lng": g["lng"], "label": g["label"],
+            "ok": g["ok"], "fail": g["fail"],
+            "color": worst["color"], "status": worst["status"],
+            "ips": sorted(
+                g["ips"],
+                key=lambda x: (-_TIER.get(x["status"], 0), -x["fail"], -x["ok"]),
+            ),
         })
     return json.dumps({
         "markers": markers,
@@ -1025,22 +1096,47 @@ function _escape(s) {
   });
 }
 
-function _popupHtml(m) {
-  var ipSafe = _escape(m.ip);
+function _ipRowHtml(row) {
+  // One line per IP inside a cluster popup. Status dot + IP + ok/fail +
+  // last user + inline ban/allow buttons. Stops propagation so the
+  // button clicks don't toggle the Leaflet popup itself.
+  var ipSafe = _escape(row.ip);
   return (
-    '<b>' + ipSafe + '</b><br>' +
-    _escape(m.label) + '<br>' +
-    '<span style="color:#6cdb8c">OK ' + m.ok + '</span> &nbsp; ' +
-    '<span style="color:#ff8a96">FAIL ' + m.fail + '</span><br>' +
-    'last user: ' + _escape(m.user || '\\u2014') + '<br>' +
-    'status: ' + _escape(m.status) +
-    '<div class="popup-actions">' +
-      '<button onclick="event.stopPropagation(); banFromPopup(\\'' + ipSafe + '\\', 900); return false;">Ban 15m</button>' +
-      '<button onclick="event.stopPropagation(); banFromPopup(\\'' + ipSafe + '\\', 3600); return false;">1h</button>' +
-      '<button onclick="event.stopPropagation(); banFromPopup(\\'' + ipSafe + '\\', 86400); return false;">24h</button>' +
-      '<button onclick="event.stopPropagation(); whitelistFromPopup(\\'' + ipSafe + '\\'); return false;" class="good">Allow</button>' +
+    '<div class="popup-row" style="border-left:3px solid ' + row.color + ';">' +
+      '<div class="popup-row-head">' +
+        '<b>' + ipSafe + '</b>' +
+        ' <span class="muted">·</span> ' +
+        '<span style="color:#6cdb8c">OK ' + row.ok + '</span> ' +
+        '<span style="color:#ff8a96">FAIL ' + row.fail + '</span>' +
+        ' <span class="muted">· ' + _escape(row.status) + '</span>' +
+      '</div>' +
+      '<div class="popup-row-sub muted">user: ' + _escape(row.user || '\\u2014') + '</div>' +
+      '<div class="popup-row-actions">' +
+        '<button onclick="event.stopPropagation(); banFromPopup(\\'' + ipSafe + '\\', 900); return false;">Ban 15m</button>' +
+        '<button onclick="event.stopPropagation(); banFromPopup(\\'' + ipSafe + '\\', 3600); return false;">1h</button>' +
+        '<button onclick="event.stopPropagation(); banFromPopup(\\'' + ipSafe + '\\', 86400); return false;">24h</button>' +
+        '<button onclick="event.stopPropagation(); whitelistFromPopup(\\'' + ipSafe + '\\'); return false;" class="good">Allow</button>' +
+      '</div>' +
     '</div>'
   );
+}
+
+function _popupHtml(m) {
+  // Header always shows the cluster location + aggregate counts. Body
+  // is one row per IP (even when there's only one) so the layout is
+  // consistent across single-IP and multi-IP markers.
+  var ipCount = (m.ips || []).length;
+  var header = (
+    '<div class="popup-header">' +
+      '<b>' + _escape(m.label) + '</b>' +
+      ' <span class="muted">· ' + ipCount + (ipCount === 1 ? ' IP' : ' IPs') + '</span>' +
+      '<br>' +
+      '<span style="color:#6cdb8c">OK ' + m.ok + '</span> &nbsp; ' +
+      '<span style="color:#ff8a96">FAIL ' + m.fail + '</span>' +
+    '</div>'
+  );
+  var body = (m.ips || []).map(_ipRowHtml).join('');
+  return '<div class="popup-cluster">' + header + body + '</div>';
 }
 
 function banFromPopup(ip, ttl) {
@@ -1068,22 +1164,33 @@ function refreshMarkers() {
   _lastMapRefresh = Date.now();
   fetch('/api/map-markers?geo=' + encodeURIComponent(_geoBackend())).then(function(r) { return r.json(); }).then(function(data) {
     _markerLayer.clearLayers();
-    // Rebuild the IP -> marker index so side-feed click-to-zoom can find
-    // the right circle marker after every refresh tick.
+    // Each marker is a (lat, lng) cluster of co-located IPs. Re-index so
+    // side-feed clicks land on the cluster whose popup lists the clicked
+    // IP — every IP points at its parent group marker.
     window._markersByIp = {};
+    var totalIps = 0;
     data.markers.forEach(function(m) {
-      var radius = Math.max(7, Math.min(22, 6 + (m.ok + m.fail) * 1.5));
+      totalIps += (m.ips || []).length;
+      // Size scales with total events at the location, not IP count, so
+      // a chatty single IP and a sparse cluster of many IPs both grow
+      // proportionally to attack volume.
+      var radius = Math.max(7, Math.min(28, 6 + (m.ok + m.fail) * 1.2));
       var marker = L.circleMarker([m.lat, m.lng], {
         radius: radius,
         color: m.color,
         weight: 2,
         fillColor: m.color,
         fillOpacity: 0.45,
-      }).bindPopup(_popupHtml(m)).addTo(_markerLayer);
-      window._markersByIp[m.ip] = marker;
+      }).bindPopup(_popupHtml(m), { maxHeight: 360, minWidth: 240 }).addTo(_markerLayer);
+      (m.ips || []).forEach(function(ipRow) {
+        window._markersByIp[ipRow.ip] = marker;
+      });
     });
     var stat = document.getElementById('map-stat');
-    if (stat) stat.textContent = '(' + data.markers.length + ' unique IPs · last ' + data.window_label + ')';
+    if (stat) {
+      var locCount = data.markers.length;
+      stat.textContent = '(' + totalIps + ' IPs across ' + locCount + (locCount === 1 ? ' location' : ' locations') + ' · last ' + data.window_label + ')';
+    }
   });
 }
 
@@ -1105,28 +1212,40 @@ function refreshSideFeed() {
   fetch('/api/feed?geo=' + encodeURIComponent(_geoBackend())).then(function(r) { return r.json(); }).then(function(data) {
     var host = document.getElementById('feed-side');
     if (!host) return;
-    if (!data.events.length) {
+    var groups = data.groups || [];
+    if (!groups.length) {
       host.innerHTML = '<p class="muted">No events. Click a scenario above.</p>';
     } else {
-      var rows = data.events.map(function(e) {
-        var verdict = e.success ? 'OK' : 'FAIL';
-        var cls = e.success ? 'ok' : 'fail';
-        var ipSafe = _escape(e.ip);
+      var rows = groups.map(function(g) {
+        // Worst-recent verdict drives the row tint — last_success false
+        // means the most recent event from this IP failed. The OK/FAIL
+        // counts on the right tell the operator whether failure is a
+        // one-off or sustained.
+        var cls = g.last_success ? 'ok' : 'fail';
+        var ipSafe = _escape(g.ip);
         return (
           '<div class="feed-row feed-' + cls + '" ' +
                'onclick="focusMapOn(\\'' + ipSafe + '\\')" ' +
                'title="Click to focus map on ' + ipSafe + '">' +
-            '<span class="t">' + _escape(e.ts) + '</span>' +
-            '<span class="v">' + verdict + '</span>' +
-            '<span class="ip">' + ipSafe + '</span>' +
-            '<span class="u">' + _escape(e.username) + '</span>' +
+            '<div class="feed-row-head">' +
+              '<span class="ip">' + ipSafe + '</span>' +
+              '<span class="muted feed-loc">' + _escape(g.label || '\\u2014') + '</span>' +
+            '</div>' +
+            '<div class="feed-row-sub">' +
+              '<span style="color:#6cdb8c">OK ' + g.ok + '</span> ' +
+              '<span style="color:#ff8a96">FAIL ' + g.fail + '</span>' +
+              ' <span class="muted">· ' + _escape(g.last_user || '\\u2014') + '</span>' +
+              ' <span class="muted t">· ' + _escape(g.ts) + '</span>' +
+            '</div>' +
           '</div>'
         );
       }).join('');
       host.innerHTML = rows;
     }
     var stat = document.getElementById('feed-stat');
-    if (stat) stat.textContent = '(' + data.total + ' buffered, newest first)';
+    if (stat) {
+      stat.textContent = '(' + groups.length + ' unique IPs from ' + data.events_scanned + ' recent events)';
+    }
   });
 }
 
@@ -1422,13 +1541,21 @@ body { overflow: hidden; }  /* page must fit viewport; no scroll */
 .leaflet-popup-tip { background: #11151a; }
 .leaflet-popup-content { font-size: 12px; margin: 10px 12px; }
 .leaflet-popup-content b { color: #ffc14a; }
-.popup-actions { margin-top: 10px; display: flex; gap: 4px; flex-wrap: wrap; }
-.popup-actions button {
+.popup-cluster .popup-header { margin-bottom: 6px; }
+.popup-cluster .popup-row {
+  padding: 6px 8px; margin: 6px 0;
+  background: #161c24; border-radius: 3px;
+}
+.popup-cluster .popup-row-head { font-size: 12px; }
+.popup-cluster .popup-row-sub { font-size: 11px; margin-top: 2px; }
+.popup-cluster .popup-row-actions { margin-top: 6px; display: flex; gap: 4px; flex-wrap: wrap; }
+.popup-cluster .popup-row-actions button {
   background: #2a1417; border: 1px solid #5a262f; color: #ff8a96;
-  padding: 4px 8px; border-radius: 3px; font-size: 11px; cursor: pointer;
+  padding: 3px 7px; border-radius: 3px; font-size: 11px; cursor: pointer;
   font-family: inherit;
 }
-.popup-actions button.good { background: #14271a; border-color: #275a35; color: #6cdb8c; }
+.popup-cluster .popup-row-actions button.good { background: #14271a; border-color: #275a35; color: #6cdb8c; }
+.popup-cluster .muted { color: #687080; }
 
 .side-feed-panel { overflow: hidden; }
 #feed-side {
@@ -1437,24 +1564,19 @@ body { overflow: hidden; }  /* page must fit viewport; no scroll */
   display: flex; flex-direction: column;
 }
 .feed-row {
-  display: grid;
-  grid-template-columns: 58px 38px 110px 1fr;
-  column-gap: 8px; align-items: center;
-  padding: 4px 8px; border-bottom: 1px solid #1a2027;
+  padding: 6px 10px; border-bottom: 1px solid #1a2027;
   font-size: 11px; line-height: 1.4; flex: 0 0 auto;
-  white-space: nowrap;
   cursor: pointer;
   transition: background-color 0.1s ease;
 }
 .feed-row:hover { background: rgba(108, 178, 255, 0.08); }
-.feed-row > * { overflow: hidden; text-overflow: ellipsis; }
-.feed-row .t { color: #687080; font-variant-numeric: tabular-nums; }
-.feed-row .v { font-weight: 600; }
-.feed-row .ip { color: #ccd; font-weight: 500; }
-.feed-row .u { color: #aab; }
-.feed-ok .v { color: #6cdb8c; }
-.feed-fail .v { color: #ff8a96; }
+.feed-row .feed-row-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.feed-row .feed-row-head .ip { color: #ccd; font-weight: 500; font-variant-numeric: tabular-nums; }
+.feed-row .feed-row-head .feed-loc { color: #889; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.feed-row .feed-row-sub { margin-top: 2px; color: #889; font-size: 10px; }
+.feed-row .feed-row-sub .t { color: #687080; font-variant-numeric: tabular-nums; }
 .feed-fail { background: rgba(255, 138, 150, 0.04); }
+.feed-fail .feed-row-head .ip { color: #ff8a96; }
 """
 
 
