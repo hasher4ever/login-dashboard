@@ -966,7 +966,9 @@ let _mapInstance = null;
 let _markerLayer = null;
 let _tileLayer = null;
 let _lastMapRefresh = 0;
-let _popupOpen = false;
+// IPs in the currently-highlighted marker cluster. Empty = no highlight.
+// Feed rendering reads this to decide which rows get the check + tint.
+let _popupIps = new Set();
 let _currentStyle = 'carto_voyager';
 
 // Attribution strings required by tile licenses.
@@ -1077,8 +1079,13 @@ function showMap(btn) {
     _markerLayer = L.layerGroup().addTo(_mapInstance);
     _addStylePicker(_mapInstance);
     _addFullscreenControl(_mapInstance);
-    _mapInstance.on('popupopen',  function() { _popupOpen = true;  });
-    _mapInstance.on('popupclose', function() { _popupOpen = false; });
+    // Click on the map background (not on a marker) clears the highlight.
+    _mapInstance.on('click', function() {
+      if (_popupIps.size) {
+        _popupIps = new Set();
+        refreshSideFeed();
+      }
+    });
   }
   // Force Leaflet to recompute size now that container is visible.
   setTimeout(function() { _mapInstance.invalidateSize(); }, 50);
@@ -1095,57 +1102,6 @@ function _escape(s) {
   return String(s).replace(/[&<>"']/g, function(c) {
     return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
   });
-}
-
-function _ipRowHtml(row) {
-  // Single-line cluster-popup row. Left-border = status color. Info cells
-  // flex naturally, action buttons sit on the right. Title attribute
-  // surfaces the truncated user/status combo on hover so nothing's hidden
-  // permanently.
-  var ipSafe = _escape(row.ip);
-  var userSafe = _escape(row.user || '\\u2014');
-  var title = ipSafe + ' · ' + userSafe + ' · ' + _escape(row.status);
-  // Single Ban dropdown replaces three side-by-side TTL buttons — the
-  // <select> styles match the previous red button and the native menu
-  // surfaces 15m/1h/24h on click. onchange fires the ban + resets the
-  // placeholder so the same row can be banned repeatedly without a
-  // re-render (Leaflet won't redraw an open popup).
-  return (
-    '<div class="popup-row" style="border-left:3px solid ' + row.color + ';" title="' + title + '">' +
-      '<span class="pr-ip">' + ipSafe + '</span>' +
-      '<span class="pr-counts">' +
-        '<span style="color:#6cdb8c">OK ' + row.ok + '</span> ' +
-        '<span style="color:#ff8a96">FAIL ' + row.fail + '</span>' +
-      '</span>' +
-      '<span class="pr-user muted">' + userSafe + '</span>' +
-      '<span class="pr-actions">' +
-        '<select class="pr-ban" onchange="event.stopPropagation(); if (this.value) { banFromPopup(\\'' + ipSafe + '\\', parseInt(this.value, 10)); this.selectedIndex = 0; }" onclick="event.stopPropagation();">' +
-          '<option value="" selected>Ban ▾</option>' +
-          '<option value="900">15m</option>' +
-          '<option value="3600">1h</option>' +
-          '<option value="86400">24h</option>' +
-        '</select>' +
-        '<button onclick="event.stopPropagation(); whitelistFromPopup(\\'' + ipSafe + '\\'); return false;" class="good">Allow</button>' +
-      '</span>' +
-    '</div>'
-  );
-}
-
-function _popupHtml(m) {
-  // Header: location · IP count · aggregate OK/FAIL — all on one line so
-  // the popup stays as short as possible. Body is one row per IP.
-  var ipCount = (m.ips || []).length;
-  var header = (
-    '<div class="popup-header">' +
-      '<b>' + _escape(m.label) + '</b>' +
-      ' <span class="muted">· ' + ipCount + (ipCount === 1 ? ' IP' : ' IPs') + '</span>' +
-      ' <span class="muted">·</span> ' +
-      '<span style="color:#6cdb8c">OK ' + m.ok + '</span> ' +
-      '<span style="color:#ff8a96">FAIL ' + m.fail + '</span>' +
-    '</div>'
-  );
-  var body = (m.ips || []).map(_ipRowHtml).join('');
-  return '<div class="popup-cluster">' + header + body + '</div>';
 }
 
 function banFromPopup(ip, ttl) {
@@ -1169,7 +1125,9 @@ function whitelistFromPopup(ip) {
 
 function refreshMarkers() {
   if (!_mapInstance || !_markerLayer) return;
-  if (_popupOpen) return;  // don't clobber an open popup with a marker refresh
+  // No popup anymore — markers can refresh on every tick. The feed
+  // highlight survives a marker-layer rebuild because _popupIps is a
+  // pure data set, not tied to a specific Leaflet layer object.
   _lastMapRefresh = Date.now();
   fetch('/api/map-markers?geo=' + encodeURIComponent(_geoBackend())).then(function(r) { return r.json(); }).then(function(data) {
     _markerLayer.clearLayers();
@@ -1190,7 +1148,24 @@ function refreshMarkers() {
         weight: 2,
         fillColor: m.color,
         fillOpacity: 0.45,
-      }).bindPopup(_popupHtml(m), { maxHeight: 360, minWidth: 280, maxWidth: 560 }).addTo(_markerLayer);
+      }).addTo(_markerLayer);
+      // Stash IPs + label on the marker. Click highlights matching feed
+      // rows instead of opening a popup — the feed already shows every
+      // field the popup did, and the highlight binding is clearer than
+      // an overlay occluding the map.
+      marker._clusterIps = (m.ips || []).map(function(r) { return r.ip; });
+      marker._clusterLabel = m.label;
+      marker.bindTooltip(
+        _escape(m.label) + ' · ' + marker._clusterIps.length + (marker._clusterIps.length === 1 ? ' IP' : ' IPs'),
+        { direction: 'top', offset: [0, -8] }
+      );
+      marker.on('click', function() {
+        // Toggle: clicking the same cluster again clears the highlight.
+        var same = _popupIps.size === marker._clusterIps.length &&
+                   marker._clusterIps.every(function(ip) { return _popupIps.has(ip); });
+        _popupIps = same ? new Set() : new Set(marker._clusterIps);
+        refreshSideFeed();
+      });
       (m.ips || []).forEach(function(ipRow) {
         window._markersByIp[ipRow.ip] = marker;
       });
@@ -1204,17 +1179,16 @@ function refreshMarkers() {
 }
 
 function focusMapOn(ip) {
-  // Side-feed entries delegate to this on click. flyTo + openPopup the
-  // existing circleMarker; no separate geo lookup needed. Silent no-op
-  // when the IP isn't on the map (event outside the window, private IP,
-  // etc.) — caller can widen the window picker if they need to see it.
+  // Side-feed row click → fly the map to that IP's cluster + highlight
+  // every row in the same cluster. Silent no-op when the IP isn't on
+  // the map (event outside the window, private IP, etc.) — operator
+  // can widen the window picker if they need to see it.
   if (!_mapInstance) return;
   var m = (window._markersByIp || {})[ip];
   if (!m) return;
-  _mapInstance.flyTo(m.getLatLng(), 15, {duration: 0.6});
-  // openPopup races the flyTo animation if called immediately, so defer
-  // just past the animation duration.
-  setTimeout(function() { m.openPopup(); }, 650);
+  _mapInstance.flyTo(m.getLatLng(), 5, {duration: 0.5});
+  _popupIps = new Set(m._clusterIps || [ip]);
+  refreshSideFeed();
 }
 
 function refreshSideFeed() {
@@ -1228,14 +1202,33 @@ function refreshSideFeed() {
       var rows = groups.map(function(g) {
         // Worst-recent verdict drives the row tint — last_success false
         // means the most recent event from this IP failed. The OK/FAIL
-        // counts on the right tell the operator whether failure is a
-        // one-off or sustained.
+        // counts tell the operator whether failure is a one-off or
+        // sustained. `feed-matched` adds an extra tint when this IP is
+        // part of the cluster the operator just clicked on the map.
         var cls = g.last_success ? 'ok' : 'fail';
         var ipSafe = _escape(g.ip);
+        var matches = _popupIps.has(g.ip);
+        var rowCls = 'feed-row feed-' + cls + (matches ? ' feed-matched' : '');
+        var check = matches ? '\\u2611' : '\\u2610';   // ☑ / ☐
+        // Ban dropdown + Allow live on every row now — no popup to host
+        // them. stopPropagation on each control so clicks don't bubble
+        // up to focusMapOn (which would yank the map mid-action).
+        var actions = (
+          '<span class="feed-actions" onclick="event.stopPropagation();">' +
+            '<select class="pr-ban" onchange="event.stopPropagation(); if (this.value) { banFromPopup(\\'' + ipSafe + '\\', parseInt(this.value, 10)); this.selectedIndex = 0; }" onclick="event.stopPropagation();">' +
+              '<option value="" selected>Ban ▾</option>' +
+              '<option value="900">15m</option>' +
+              '<option value="3600">1h</option>' +
+              '<option value="86400">24h</option>' +
+            '</select>' +
+            '<button onclick="event.stopPropagation(); whitelistFromPopup(\\'' + ipSafe + '\\'); return false;" class="good">Allow</button>' +
+          '</span>'
+        );
         return (
-          '<div class="feed-row feed-' + cls + '" ' +
+          '<div class="' + rowCls + '" ' +
                'onclick="focusMapOn(\\'' + ipSafe + '\\')" ' +
                'title="Click to focus map on ' + ipSafe + '">' +
+            '<span class="check">' + check + '</span>' +
             '<span class="ip">' + ipSafe + '</span>' +
             '<span class="counts">' +
               '<span style="color:#6cdb8c">OK ' + g.ok + '</span> ' +
@@ -1244,6 +1237,7 @@ function refreshSideFeed() {
             '<span class="user">' + _escape(g.last_user || '\\u2014') + '</span>' +
             '<span class="t">' + _escape(g.ts) + '</span>' +
             '<span class="feed-loc">' + _escape(g.label || '\\u2014') + '</span>' +
+            actions +
           '</div>'
         );
       }).join('');
@@ -1628,40 +1622,13 @@ body { overflow: hidden; }  /* page must fit viewport; no scroll */
 .leaflet-control-attribution a { color: #6cb2ff !important; }
 .leaflet-control-attribution a:hover { color: #8cc3ff !important; }
 
-.leaflet-popup-content-wrapper { background: #11151a; color: #e6e6e6; border-radius: 4px; }
-.leaflet-popup-tip { background: #11151a; }
-.leaflet-popup-content { font-size: 12px; margin: 10px 12px; }
-.leaflet-popup-content b { color: #ffc14a; }
-.popup-cluster { min-width: 280px; }
-.popup-cluster .popup-header { margin-bottom: 4px; font-size: 12px; line-height: 1.3; }
-.popup-cluster .popup-row {
-  display: grid;
-  grid-template-columns: minmax(105px, auto) auto minmax(0, 1fr) auto;
-  column-gap: 6px; align-items: center;
-  padding: 2px 6px; margin: 2px 0;
-  background: #161c24; border-radius: 3px;
-  font-size: 11px; line-height: 1.25; white-space: nowrap;
+/* Leaflet's default tooltip on the markers — same dark scheme. */
+.leaflet-tooltip {
+  background: #11151a; color: #e6e6e6;
+  border: 1px solid #2a3340; border-radius: 4px;
+  font-size: 11px; padding: 3px 7px;
 }
-.popup-cluster .popup-row > * { overflow: hidden; text-overflow: ellipsis; }
-.popup-cluster .pr-ip { color: #ffc14a; font-weight: 600; font-variant-numeric: tabular-nums; }
-.popup-cluster .pr-counts { font-variant-numeric: tabular-nums; }
-.popup-cluster .pr-user { color: #889; }
-.popup-cluster .pr-actions { display: inline-flex; gap: 2px; flex-shrink: 0; }
-.popup-cluster .pr-actions button {
-  background: #2a1417; border: 1px solid #5a262f; color: #ff8a96;
-  padding: 1px 6px; border-radius: 3px; font-size: 10px; cursor: pointer;
-  font-family: inherit; line-height: 1.15;
-}
-.popup-cluster .pr-actions button.good { background: #14271a; border-color: #275a35; color: #6cdb8c; }
-.popup-cluster .pr-actions select.pr-ban {
-  background: #2a1417; border: 1px solid #5a262f; color: #ff8a96;
-  padding: 1px 4px; border-radius: 3px; font-size: 10px; cursor: pointer;
-  font-family: inherit; line-height: 1.15;
-  appearance: none; -webkit-appearance: none;
-}
-.popup-cluster .pr-actions select.pr-ban:hover { background: #3a1c20; }
-.popup-cluster .pr-actions select.pr-ban option { background: #11151a; color: #e6e6e6; }
-.popup-cluster .muted { color: #687080; }
+.leaflet-tooltip-top:before { border-top-color: #11151a; }
 
 .side-feed-panel { overflow: hidden; }
 #feed-side {
@@ -1671,8 +1638,8 @@ body { overflow: hidden; }  /* page must fit viewport; no scroll */
 }
 .feed-row {
   display: grid;
-  grid-template-columns: 122px 78px minmax(0, 1.4fr) 72px minmax(0, 1fr);
-  column-gap: 10px; align-items: center;
+  grid-template-columns: 18px 122px 78px minmax(0, 1.2fr) 72px minmax(0, 1fr) auto;
+  column-gap: 8px; align-items: center;
   padding: 2px 10px; border-bottom: 1px solid #1a2027;
   font-size: 11px; line-height: 1.25; flex: 0 0 auto;
   white-space: nowrap;
@@ -1681,6 +1648,7 @@ body { overflow: hidden; }  /* page must fit viewport; no scroll */
 }
 .feed-row > * { overflow: hidden; text-overflow: ellipsis; }
 .feed-row:hover { background: rgba(108, 178, 255, 0.08); }
+.feed-row .check { color: #687080; font-size: 14px; text-align: center; }
 .feed-row .ip { color: #ccd; font-weight: 500; font-variant-numeric: tabular-nums; }
 .feed-row .counts { font-variant-numeric: tabular-nums; }
 .feed-row .user { color: #aab; }
@@ -1688,6 +1656,24 @@ body { overflow: hidden; }  /* page must fit viewport; no scroll */
 .feed-row .feed-loc { color: #889; text-align: right; }
 .feed-fail { background: rgba(255, 138, 150, 0.04); }
 .feed-fail .ip { color: #ff8a96; }
+/* Cluster-highlighted rows — operator clicked the matching marker on
+   the map. Stripe on the left + brighter tint draws the eye fast. */
+.feed-matched { background: rgba(108, 178, 255, 0.14); box-shadow: inset 3px 0 0 #6cb2ff; }
+.feed-matched .check { color: #6cb2ff; }
+.feed-actions { display: inline-flex; gap: 4px; flex-shrink: 0; }
+.feed-actions select.pr-ban,
+.feed-actions button {
+  background: #2a1417; border: 1px solid #5a262f; color: #ff8a96;
+  padding: 1px 6px; border-radius: 3px; font-size: 10px; cursor: pointer;
+  font-family: inherit; line-height: 1.15;
+}
+.feed-actions select.pr-ban {
+  padding: 1px 4px; appearance: none; -webkit-appearance: none;
+}
+.feed-actions select.pr-ban option { background: #11151a; color: #e6e6e6; }
+.feed-actions button.good { background: #14271a; border-color: #275a35; color: #6cdb8c; }
+.feed-actions button:hover,
+.feed-actions select.pr-ban:hover { filter: brightness(1.2); }
 """
 
 
