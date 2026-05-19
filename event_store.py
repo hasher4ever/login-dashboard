@@ -253,9 +253,18 @@ def insert_batch(events: list[dict]) -> bool:
     rows = [_row_from_event(e) for e in events]
     try:
         client.execute(INSERT_SQL, rows)
+        before = _status["rows_inserted"]
         _status["last_insert_at"] = time.time()
-        _status["rows_inserted"] += len(rows)
+        _status["rows_inserted"] = before + len(rows)
         _status["connected"] = True
+        # Log only on milestones (first batch, then every 100 batches) so
+        # operators can see the pipeline is healthy without spamming logs
+        # at high traffic. Real ingest counts are visible on the header pill.
+        new_total = _status["rows_inserted"]
+        if before == 0:
+            print(f"[ch] first batch landed — {len(rows)} rows, total={new_total}", flush=True)
+        elif new_total // 100 != before // 100:
+            print(f"[ch] {new_total} rows ingested (batch +{len(rows)})", flush=True)
         return True
     except Exception as e:  # noqa: BLE001
         _status["last_error"] = str(e)[:200]
