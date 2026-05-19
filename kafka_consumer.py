@@ -226,8 +226,8 @@ def _consume_loop(on_event: Callable[[dict], None]) -> None:
                 # Diag: log every checkpoint at batch milestones until we
                 # observe one successful flush.
                 seen = status()["messages_seen"]
-                # Brute-force diag: log every flush-check (first 20 only)
-                if seen <= 20 or size_ok or age_ok:
+                # Brute-force diag: every 25th event + every flush trigger
+                if seen <= 5 or seen % 25 == 0 or size_ok or age_ok:
                     print(
                         f"[kafka] flush-check seen={seen} len(batch)={len(batch)} "
                         f"age={age:.3f}s size_ok={size_ok} age_ok={age_ok}",
