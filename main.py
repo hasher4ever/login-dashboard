@@ -89,7 +89,25 @@ def log(msg: str) -> None:
 
 
 # ---------- SSE fan-out ------------------------------------------------------
+# Throttle SSE broadcasts to at most one per BROADCAST_MIN_INTERVAL_S. Without
+# this, a Kafka replay storm (potentially thousands of events delivered in a
+# few seconds at boot) would fire one SSE update per ingest, overflow every
+# subscriber's 200-deep queue, and either kill browsers under refresh load
+# or get them disconnected. Surplus broadcasts are dropped — the panels'
+# hx-trigger="every 5s" fallback fills the gap.
+BROADCAST_MIN_INTERVAL_S = 0.25
+_broadcast_lock = threading.Lock()
+_last_broadcast_ts = 0.0
+
+
 def broadcast(event: str = "update", data: str = "ok") -> None:
+    global _last_broadcast_ts
+    with _broadcast_lock:
+        n = time.time()
+        if n - _last_broadcast_ts < BROADCAST_MIN_INTERVAL_S:
+            return
+        _last_broadcast_ts = n
+
     payload = f"event: {event}\ndata: {data}\n\n"
     dead = []
     with state_lock:
@@ -113,10 +131,27 @@ def sse_pinger():
 
 
 # ---------- ingestion + alert rules ------------------------------------------
+def _parse_source_ts(s: Optional[str]) -> Optional[float]:
+    """Best-effort ISO-8601 → unix seconds. None on missing/garbage so the
+    caller can fall back to wall-clock now()."""
+    if not s:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
 def ingest_event(ev: dict) -> None:
-    """Append an event, update bans/alerts, and notify subscribers."""
+    """Append an event, update bans/alerts, and notify subscribers.
+
+    Stamps ev['ts'] with the SOURCE timestamp (when tms-auth produced) when
+    available, falling back to now(). This is what makes "last 6 hours"
+    windows honest during boot-time Kafka replay — a replayed event from
+    3 hours ago is treated as 3 hours ago, not as just-arrived."""
     ev = dict(ev)
-    ev["ts"] = now()
+    ev["ts"] = _parse_source_ts(ev.get("source_ts")) or now()
     with state_lock:
         events.append(ev)
         _recompute_alerts_locked()

@@ -40,6 +40,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from typing import Callable, Optional
 
 # Silence kafka-python's chatty internal loggers — Railway's deployment log
@@ -105,14 +106,24 @@ def _build_consumer():
 
     brokers = _env("KAFKA_BROKERS")
     topic = _env("KAFKA_TOPIC", "auth_events")
-    group_id = _env("KAFKA_GROUP_ID", "login-dashboard")
+    # Ephemeral per-process group_id by default so each boot replays Kafka's
+    # full retention into the buffer — without that, the windowed views
+    # ("last 6 hours", "last 24 hours") are empty until enough live traffic
+    # has accumulated. Operators can override with KAFKA_GROUP_ID for the
+    # rare "I want to resume from where I left off" use case.
+    group_id = _env("KAFKA_GROUP_ID", f"login-dashboard-{uuid.uuid4().hex[:8]}")
     sec = _env("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
 
     kw = dict(
         bootstrap_servers=[b.strip() for b in brokers.split(",") if b.strip()],
         group_id=group_id,
-        auto_offset_reset="latest",
-        enable_auto_commit=True,
+        # Replay from the start of whatever Kafka still retains. Paired with
+        # auto_commit=False so subsequent restarts (even within retention)
+        # also start from earliest — there's no committed offset to resume
+        # from. Practical history depth is bounded by min(Kafka retention,
+        # BUFFER_SIZE events).
+        auto_offset_reset="earliest",
+        enable_auto_commit=False,
         value_deserializer=lambda b: json.loads(b.decode("utf-8")) if b else None,
         security_protocol=sec,
         # Default consumer_timeout_ms is float('inf') = block forever on empty
