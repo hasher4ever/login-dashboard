@@ -455,7 +455,7 @@ def render_page(
        Using a class on the parent (rather than inline style on the wrapper)
        so HTMX swaps inside #content cannot clobber visibility state. -->
   <div id="map-wrapper">
-    <div class="map-split">
+    <div class="map-split" id="map-split">
       <section class="panel map-panel">
         <h2>Geographic distribution <span id="map-stat" class="muted"></span></h2>
         <div class="map-legend">
@@ -470,6 +470,7 @@ def render_page(
         </div>
         <div id="login-map"></div>
       </section>
+      <div class="map-resizer" id="map-resizer" title="Drag to resize" role="separator" aria-orientation="vertical"></div>
       <section class="panel side-feed-panel">
         <h2>Live feed <span id="feed-stat" class="muted"></span></h2>
         <div id="feed-side">
@@ -1097,26 +1098,27 @@ function _escape(s) {
 }
 
 function _ipRowHtml(row) {
-  // One line per IP inside a cluster popup. Status dot + IP + ok/fail +
-  // last user + inline ban/allow buttons. Stops propagation so the
-  // button clicks don't toggle the Leaflet popup itself.
+  // Single-line cluster-popup row. Left-border = status color. Info cells
+  // flex naturally, action buttons sit on the right. Title attribute
+  // surfaces the truncated user/status combo on hover so nothing's hidden
+  // permanently.
   var ipSafe = _escape(row.ip);
+  var userSafe = _escape(row.user || '\\u2014');
+  var title = ipSafe + ' · ' + userSafe + ' · ' + _escape(row.status);
   return (
-    '<div class="popup-row" style="border-left:3px solid ' + row.color + ';">' +
-      '<div class="popup-row-head">' +
-        '<b>' + ipSafe + '</b>' +
-        ' <span class="muted">·</span> ' +
+    '<div class="popup-row" style="border-left:3px solid ' + row.color + ';" title="' + title + '">' +
+      '<span class="pr-ip">' + ipSafe + '</span>' +
+      '<span class="pr-counts">' +
         '<span style="color:#6cdb8c">OK ' + row.ok + '</span> ' +
         '<span style="color:#ff8a96">FAIL ' + row.fail + '</span>' +
-        ' <span class="muted">· ' + _escape(row.status) + '</span>' +
-      '</div>' +
-      '<div class="popup-row-sub muted">user: ' + _escape(row.user || '\\u2014') + '</div>' +
-      '<div class="popup-row-actions">' +
-        '<button onclick="event.stopPropagation(); banFromPopup(\\'' + ipSafe + '\\', 900); return false;">Ban 15m</button>' +
+      '</span>' +
+      '<span class="pr-user muted">' + userSafe + '</span>' +
+      '<span class="pr-actions">' +
+        '<button onclick="event.stopPropagation(); banFromPopup(\\'' + ipSafe + '\\', 900); return false;">15m</button>' +
         '<button onclick="event.stopPropagation(); banFromPopup(\\'' + ipSafe + '\\', 3600); return false;">1h</button>' +
         '<button onclick="event.stopPropagation(); banFromPopup(\\'' + ipSafe + '\\', 86400); return false;">24h</button>' +
-        '<button onclick="event.stopPropagation(); whitelistFromPopup(\\'' + ipSafe + '\\'); return false;" class="good">Allow</button>' +
-      '</div>' +
+        '<button onclick="event.stopPropagation(); whitelistFromPopup(\\'' + ipSafe + '\\'); return false;" class="good">✓</button>' +
+      '</span>' +
     '</div>'
   );
 }
@@ -1227,16 +1229,14 @@ function refreshSideFeed() {
           '<div class="feed-row feed-' + cls + '" ' +
                'onclick="focusMapOn(\\'' + ipSafe + '\\')" ' +
                'title="Click to focus map on ' + ipSafe + '">' +
-            '<div class="feed-row-head">' +
-              '<span class="ip">' + ipSafe + '</span>' +
-              '<span class="muted feed-loc">' + _escape(g.label || '\\u2014') + '</span>' +
-            '</div>' +
-            '<div class="feed-row-sub">' +
+            '<span class="ip">' + ipSafe + '</span>' +
+            '<span class="counts">' +
               '<span style="color:#6cdb8c">OK ' + g.ok + '</span> ' +
               '<span style="color:#ff8a96">FAIL ' + g.fail + '</span>' +
-              ' <span class="muted">· ' + _escape(g.last_user || '\\u2014') + '</span>' +
-              ' <span class="muted t">· ' + _escape(g.ts) + '</span>' +
-            '</div>' +
+            '</span>' +
+            '<span class="user">' + _escape(g.last_user || '\\u2014') + '</span>' +
+            '<span class="t">' + _escape(g.ts) + '</span>' +
+            '<span class="feed-loc">' + _escape(g.label || '\\u2014') + '</span>' +
           '</div>'
         );
       }).join('');
@@ -1269,7 +1269,78 @@ document.addEventListener('DOMContentLoaded', function() {
     if (activeBtn) showMap(activeBtn);
   }
   populateGeoPicker();
+  initMapResizer();
 });
+
+// ----- Map / feed split resizer --------------------------------------------
+// Vertical drag handle between the map and the live feed. Width is persisted
+// in localStorage as a pixel value so it survives reloads + window resizes.
+// Clamped to [240, viewport-360] so neither pane disappears.
+
+function _clampFeedWidth(px) {
+  var minFeed = 240, minMap = 360;
+  var max = Math.max(minFeed, window.innerWidth - minMap);
+  return Math.max(minFeed, Math.min(max, px));
+}
+
+function _applyFeedWidth(px) {
+  var split = document.getElementById('map-split');
+  if (!split) return;
+  split.style.setProperty('--feed-width', _clampFeedWidth(px) + 'px');
+  if (_mapInstance) _mapInstance.invalidateSize();
+}
+
+function initMapResizer() {
+  var resizer = document.getElementById('map-resizer');
+  var split = document.getElementById('map-split');
+  if (!resizer || !split) return;
+
+  // Restore saved width on first paint.
+  try {
+    var saved = parseInt(localStorage.getItem('feed_width'), 10);
+    if (saved && saved > 0) _applyFeedWidth(saved);
+  } catch (e) {}
+
+  var dragging = false;
+  function onMove(ev) {
+    if (!dragging) return;
+    // Feed is the right-most column → its width = viewport_right_edge - cursor.
+    // Use clientX so it works with both mouse + touch (PointerEvents coalesce).
+    var rect = split.getBoundingClientRect();
+    var newWidth = rect.right - ev.clientX;
+    _applyFeedWidth(newWidth);
+    ev.preventDefault();
+  }
+  function onUp() {
+    if (!dragging) return;
+    dragging = false;
+    resizer.classList.remove('dragging');
+    document.body.style.userSelect = '';
+    // Persist the actual rendered width (after clamp).
+    var rect = split.getBoundingClientRect();
+    var feedEl = split.querySelector('.side-feed-panel');
+    if (feedEl) {
+      try { localStorage.setItem('feed_width', String(Math.round(feedEl.getBoundingClientRect().width))); } catch (e) {}
+    }
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+  }
+  resizer.addEventListener('pointerdown', function(ev) {
+    dragging = true;
+    resizer.classList.add('dragging');
+    document.body.style.userSelect = 'none';   // stop text-selecting mid-drag
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    ev.preventDefault();
+  });
+
+  // Re-clamp on viewport resize so a saved width that's now too wide
+  // doesn't push either pane below its minimum.
+  window.addEventListener('resize', function() {
+    var feedEl = split.querySelector('.side-feed-panel');
+    if (feedEl) _applyFeedWidth(feedEl.getBoundingClientRect().width);
+  });
+}
 
 // ----- GeoIP backend selector ----------------------------------------------
 // User picks which GeoIP database the map resolves IPs against. Choice is
@@ -1463,11 +1534,24 @@ form.inline { display: inline; margin: 0; }
 body { overflow: hidden; }  /* page must fit viewport; no scroll */
 
 .map-split {
-  display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 3fr);
-  gap: 14px; align-items: stretch;
+  --feed-width: 420px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 6px var(--feed-width);
+  align-items: stretch;
   height: calc(100vh - 130px);
 }
 .map-split > .panel { margin-bottom: 0; display: flex; flex-direction: column; min-width: 0; }
+.map-resizer {
+  cursor: col-resize;
+  background: #1a2027;
+  position: relative;
+  transition: background-color 0.15s ease;
+}
+.map-resizer:hover, .map-resizer.dragging { background: #3a4757; }
+.map-resizer::after {
+  content: ""; position: absolute;
+  left: -4px; right: -4px; top: 0; bottom: 0;   /* widen the hit target */
+}
 .map-panel { padding-bottom: 12px; }
 .map-legend {
   display: flex; gap: 14px; margin-bottom: 10px;
@@ -1541,20 +1625,27 @@ body { overflow: hidden; }  /* page must fit viewport; no scroll */
 .leaflet-popup-tip { background: #11151a; }
 .leaflet-popup-content { font-size: 12px; margin: 10px 12px; }
 .leaflet-popup-content b { color: #ffc14a; }
+.popup-cluster { min-width: 380px; }
 .popup-cluster .popup-header { margin-bottom: 6px; }
 .popup-cluster .popup-row {
-  padding: 6px 8px; margin: 6px 0;
+  display: grid;
+  grid-template-columns: minmax(110px, auto) auto minmax(0, 1fr) auto;
+  column-gap: 8px; align-items: center;
+  padding: 5px 8px; margin: 4px 0;
   background: #161c24; border-radius: 3px;
+  font-size: 11px; white-space: nowrap;
 }
-.popup-cluster .popup-row-head { font-size: 12px; }
-.popup-cluster .popup-row-sub { font-size: 11px; margin-top: 2px; }
-.popup-cluster .popup-row-actions { margin-top: 6px; display: flex; gap: 4px; flex-wrap: wrap; }
-.popup-cluster .popup-row-actions button {
+.popup-cluster .popup-row > * { overflow: hidden; text-overflow: ellipsis; }
+.popup-cluster .pr-ip { color: #ffc14a; font-weight: 600; font-variant-numeric: tabular-nums; }
+.popup-cluster .pr-counts { font-variant-numeric: tabular-nums; }
+.popup-cluster .pr-user { color: #889; }
+.popup-cluster .pr-actions { display: inline-flex; gap: 3px; flex-shrink: 0; }
+.popup-cluster .pr-actions button {
   background: #2a1417; border: 1px solid #5a262f; color: #ff8a96;
-  padding: 3px 7px; border-radius: 3px; font-size: 11px; cursor: pointer;
-  font-family: inherit;
+  padding: 2px 6px; border-radius: 3px; font-size: 10px; cursor: pointer;
+  font-family: inherit; line-height: 1.2;
 }
-.popup-cluster .popup-row-actions button.good { background: #14271a; border-color: #275a35; color: #6cdb8c; }
+.popup-cluster .pr-actions button.good { background: #14271a; border-color: #275a35; color: #6cdb8c; padding: 2px 7px; }
 .popup-cluster .muted { color: #687080; }
 
 .side-feed-panel { overflow: hidden; }
@@ -1564,19 +1655,24 @@ body { overflow: hidden; }  /* page must fit viewport; no scroll */
   display: flex; flex-direction: column;
 }
 .feed-row {
+  display: grid;
+  grid-template-columns: 122px 78px minmax(0, 1.4fr) 72px minmax(0, 1fr);
+  column-gap: 10px; align-items: center;
   padding: 6px 10px; border-bottom: 1px solid #1a2027;
   font-size: 11px; line-height: 1.4; flex: 0 0 auto;
+  white-space: nowrap;
   cursor: pointer;
   transition: background-color 0.1s ease;
 }
+.feed-row > * { overflow: hidden; text-overflow: ellipsis; }
 .feed-row:hover { background: rgba(108, 178, 255, 0.08); }
-.feed-row .feed-row-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
-.feed-row .feed-row-head .ip { color: #ccd; font-weight: 500; font-variant-numeric: tabular-nums; }
-.feed-row .feed-row-head .feed-loc { color: #889; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.feed-row .feed-row-sub { margin-top: 2px; color: #889; font-size: 10px; }
-.feed-row .feed-row-sub .t { color: #687080; font-variant-numeric: tabular-nums; }
+.feed-row .ip { color: #ccd; font-weight: 500; font-variant-numeric: tabular-nums; }
+.feed-row .counts { font-variant-numeric: tabular-nums; }
+.feed-row .user { color: #aab; }
+.feed-row .t { color: #687080; font-variant-numeric: tabular-nums; text-align: right; }
+.feed-row .feed-loc { color: #889; text-align: right; }
 .feed-fail { background: rgba(255, 138, 150, 0.04); }
-.feed-fail .feed-row-head .ip { color: #ff8a96; }
+.feed-fail .ip { color: #ff8a96; }
 """
 
 
