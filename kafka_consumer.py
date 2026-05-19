@@ -223,13 +223,13 @@ def _consume_loop(on_event: Callable[[dict], None]) -> None:
                 age = now_ts - last_flush
                 size_ok = len(batch) >= BATCH_MAX_ROWS
                 age_ok = bool(batch) and age >= BATCH_MAX_AGE_S
-                # Diag (capped): first 5 iterations log the condition values
-                # so we can see whether the flush is gated or just never reached.
+                # Diag: log every checkpoint at batch milestones until we
+                # observe one successful flush.
                 seen = status()["messages_seen"]
-                if seen <= 5:
+                if seen in (1, 5, 50, 100, 190, 199, 200, 201, 300) or size_ok or age_ok:
                     print(
                         f"[kafka] flush-check seen={seen} len(batch)={len(batch)} "
-                        f"age={age:.2f}s size_ok={size_ok} age_ok={age_ok}",
+                        f"age={age:.3f}s size_ok={size_ok} age_ok={age_ok}",
                         flush=True,
                     )
                 if size_ok or age_ok:
