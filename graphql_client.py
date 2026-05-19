@@ -103,7 +103,7 @@ def _post(query: str, variables: dict, jwt: Optional[str] = None) -> dict:
 # ---------- queries / mutations ----------------------------------------------
 
 Q_LIST = """
-query IpAccessRules($listType: AccessListType!) {
+query IpAccessRules($listType: IPAccessListType!) {
   ipAccessRules(listType: $listType) {
     id
     ip
@@ -134,7 +134,7 @@ mutation Ban($ip: String!, $ttl: Int!, $reason: String) {
 """
 
 M_REMOVE = """
-mutation Remove($id: ID!) {
+mutation Remove($id: UUID!) {
   removeIPRule(id: $id)
 }
 """
