@@ -1124,16 +1124,15 @@ function _ipRowHtml(row) {
 }
 
 function _popupHtml(m) {
-  // Header always shows the cluster location + aggregate counts. Body
-  // is one row per IP (even when there's only one) so the layout is
-  // consistent across single-IP and multi-IP markers.
+  // Header: location · IP count · aggregate OK/FAIL — all on one line so
+  // the popup stays as short as possible. Body is one row per IP.
   var ipCount = (m.ips || []).length;
   var header = (
     '<div class="popup-header">' +
       '<b>' + _escape(m.label) + '</b>' +
       ' <span class="muted">· ' + ipCount + (ipCount === 1 ? ' IP' : ' IPs') + '</span>' +
-      '<br>' +
-      '<span style="color:#6cdb8c">OK ' + m.ok + '</span> &nbsp; ' +
+      ' <span class="muted">·</span> ' +
+      '<span style="color:#6cdb8c">OK ' + m.ok + '</span> ' +
       '<span style="color:#ff8a96">FAIL ' + m.fail + '</span>' +
     '</div>'
   );
@@ -1183,7 +1182,7 @@ function refreshMarkers() {
         weight: 2,
         fillColor: m.color,
         fillOpacity: 0.45,
-      }).bindPopup(_popupHtml(m), { maxHeight: 360, minWidth: 240 }).addTo(_markerLayer);
+      }).bindPopup(_popupHtml(m), { maxHeight: 360, minWidth: 280, maxWidth: 560 }).addTo(_markerLayer);
       (m.ips || []).forEach(function(ipRow) {
         window._markersByIp[ipRow.ip] = marker;
       });
@@ -1625,27 +1624,27 @@ body { overflow: hidden; }  /* page must fit viewport; no scroll */
 .leaflet-popup-tip { background: #11151a; }
 .leaflet-popup-content { font-size: 12px; margin: 10px 12px; }
 .leaflet-popup-content b { color: #ffc14a; }
-.popup-cluster { min-width: 380px; }
-.popup-cluster .popup-header { margin-bottom: 6px; }
+.popup-cluster { min-width: 280px; }
+.popup-cluster .popup-header { margin-bottom: 4px; font-size: 12px; line-height: 1.3; }
 .popup-cluster .popup-row {
   display: grid;
-  grid-template-columns: minmax(110px, auto) auto minmax(0, 1fr) auto;
-  column-gap: 8px; align-items: center;
-  padding: 5px 8px; margin: 4px 0;
+  grid-template-columns: minmax(105px, auto) auto minmax(0, 1fr) auto;
+  column-gap: 6px; align-items: center;
+  padding: 2px 6px; margin: 2px 0;
   background: #161c24; border-radius: 3px;
-  font-size: 11px; white-space: nowrap;
+  font-size: 11px; line-height: 1.25; white-space: nowrap;
 }
 .popup-cluster .popup-row > * { overflow: hidden; text-overflow: ellipsis; }
 .popup-cluster .pr-ip { color: #ffc14a; font-weight: 600; font-variant-numeric: tabular-nums; }
 .popup-cluster .pr-counts { font-variant-numeric: tabular-nums; }
 .popup-cluster .pr-user { color: #889; }
-.popup-cluster .pr-actions { display: inline-flex; gap: 3px; flex-shrink: 0; }
+.popup-cluster .pr-actions { display: inline-flex; gap: 2px; flex-shrink: 0; }
 .popup-cluster .pr-actions button {
   background: #2a1417; border: 1px solid #5a262f; color: #ff8a96;
-  padding: 2px 6px; border-radius: 3px; font-size: 10px; cursor: pointer;
-  font-family: inherit; line-height: 1.2;
+  padding: 1px 5px; border-radius: 3px; font-size: 10px; cursor: pointer;
+  font-family: inherit; line-height: 1.15;
 }
-.popup-cluster .pr-actions button.good { background: #14271a; border-color: #275a35; color: #6cdb8c; padding: 2px 7px; }
+.popup-cluster .pr-actions button.good { background: #14271a; border-color: #275a35; color: #6cdb8c; padding: 1px 6px; }
 .popup-cluster .muted { color: #687080; }
 
 .side-feed-panel { overflow: hidden; }
@@ -1658,8 +1657,8 @@ body { overflow: hidden; }  /* page must fit viewport; no scroll */
   display: grid;
   grid-template-columns: 122px 78px minmax(0, 1.4fr) 72px minmax(0, 1fr);
   column-gap: 10px; align-items: center;
-  padding: 6px 10px; border-bottom: 1px solid #1a2027;
-  font-size: 11px; line-height: 1.4; flex: 0 0 auto;
+  padding: 2px 10px; border-bottom: 1px solid #1a2027;
+  font-size: 11px; line-height: 1.25; flex: 0 0 auto;
   white-space: nowrap;
   cursor: pointer;
   transition: background-color 0.1s ease;
