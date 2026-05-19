@@ -250,6 +250,21 @@ def _ensemble_lookup(ip: str) -> Optional[tuple[float, float, str]]:
 
 # ----- helpers -------------------------------------------------------------
 
+def is_low_confidence_label(label: str) -> bool:
+    """True if the label is country-only or a pure fallback.
+
+    Country-only labels (e.g. "US", "GB") mean the backing GeoIP DB
+    knew the country but couldn't pinpoint a city — so the (lat, lng)
+    is the DB's country-centroid sentinel (Cheney Reservoir for US,
+    Brunswick for DE, etc.). Markers placed on those coords are
+    geographically meaningless and worth flagging visually so the
+    operator doesn't read them as real Kansas / Brunswick traffic."""
+    if not label or label == FALLBACK_LABEL or label == "private/reserved":
+        return True
+    parts = [p.strip() for p in label.split(",") if p.strip()]
+    return len(parts) <= 1
+
+
 def _label(city: str, region: str, cc: str) -> str:
     """Render a human-readable place string. Region only shown when it
     isn't duplicating the city (e.g. "New York, NY, US" but "Tashkent, UZ")

@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
-from geo import geolocate, available_backends
+from geo import geolocate, available_backends, is_low_confidence_label
 import geo_refresh
 from scenarios import SCENARIOS
 import kafka_consumer
@@ -464,6 +464,7 @@ def render_page(
           <span class="dot" style="background:#ff8a96"></span>hot
           <span class="dot" style="background:#ff4d63"></span>banned
           <span class="dot" style="background:#6cdb8c"></span>allowlisted
+          <span class="dot" style="background:#7a8290"></span>unknown location
           <span style="flex:1"></span>
           <button class="ghost" onclick="refreshMarkers();">↻ refresh</button>
         </div>
@@ -594,6 +595,14 @@ def map_markers_json(window_s: int = DEFAULT_WINDOW_S, geo_backend: Optional[str
             color, status = "#ff4d63", "blocked"
         elif ip in ban_map and ban_map[ip]["expires_at"] > n:
             color, status = "#ff4d63", "banned"
+        elif is_low_confidence_label(label):
+            # Country-only / fallback location — marker is on a DB centroid
+            # sentinel (Cheney Reservoir, Brunswick, mid-Atlantic). Paint
+            # grey so the operator doesn't read "hot Kansas traffic" off a
+            # cluster that's really just "unknown city, somewhere in US".
+            # Operator-set states (allow/block/ban) still win above so
+            # explicit decisions aren't masked by GeoIP uncertainty.
+            color, status = "#7a8290", "unknown-location"
         elif r["fail"] >= 5:
             color, status = "#ff8a96", "hot"
         elif r["fail"] > 0:
@@ -886,7 +895,7 @@ let _markerLayer = null;
 let _tileLayer = null;
 let _lastMapRefresh = 0;
 let _popupOpen = false;
-let _currentStyle = 'carto_dark';
+let _currentStyle = 'carto_voyager';
 
 // Attribution strings required by tile licenses.
 var _CARTO_ATTR = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>';
@@ -992,7 +1001,7 @@ function showMap(btn) {
       attributionControl: false, // disable default (bottomright); custom one below at bottomleft
     }).setView([30, 30], 2);
     L.control.attribution({ position: 'bottomleft', prefix: false }).addTo(_mapInstance);
-    setMapStyle('carto_dark');
+    setMapStyle('carto_voyager');
     _markerLayer = L.layerGroup().addTo(_mapInstance);
     _addStylePicker(_mapInstance);
     _addFullscreenControl(_mapInstance);
