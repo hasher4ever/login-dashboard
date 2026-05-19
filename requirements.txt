@@ -4,6 +4,9 @@ kafka-python>=2.0.2
 # `snappy` module on demand. python-snappy provides it. Needs libsnappy-dev
 # at build time (see Dockerfile).
 python-snappy>=0.7.0
-# Pure-Python HTTP client for ClickHouse — no C extensions, so the Dockerfile
-# image stays small. Used by event_store.py for persistent event storage.
-clickhouse-connect>=0.7.0
+# Native-TCP ClickHouse client. Used instead of clickhouse-connect (HTTP)
+# because the TMS360 ClickHouse instance only accepts auth on the native
+# protocol (port 9000) — backend-audit uses the same path. clickhouse-driver
+# has a small C extension (cityhash) so it needs gcc at build time, which
+# the Dockerfile already provides for python-snappy.
+clickhouse-driver>=0.2.9

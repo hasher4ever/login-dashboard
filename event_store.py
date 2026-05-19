@@ -8,7 +8,12 @@ Why CH and not Postgres / SQLite:
   gives cheap retention and bounded storage with no maintenance
 - Window queries (`last 24 hours by IP`) are the access pattern CH was
   built for; sub-second p99 on millions of rows
-- Pure-Python client (`clickhouse-connect`) — no C extensions in the image
+
+Protocol choice: the TMS360 CH instance rejects HTTP Basic auth (8123) — the
+backend-audit service connects successfully on port 9000 with the native TCP
+protocol, and we follow that path. Library: `clickhouse-driver`. Pure-Python
+client with a small cityhash C extension (the Dockerfile already provides
+gcc for python-snappy so this builds without extra work).
 
 Read paths that hit this module: aggregates_snapshot / map_markers_json /
 feed_json / render_live_panel. Alert recomputation deliberately stays in
@@ -30,8 +35,8 @@ import threading
 import time
 from typing import Optional
 
-# clickhouse-connect imports lazily so the dashboard can boot without it
-# installed (useful for local-only dev when CH isn't configured).
+# clickhouse-driver's Client; lazy-imported so the dashboard can boot without
+# it installed (useful for local-only dev when CH isn't configured).
 _client = None
 _client_lock = threading.Lock()
 _status = {
@@ -45,9 +50,10 @@ _status = {
 
 TABLE = "security_auth_events"
 
-# Silence clickhouse-connect's INFO chatter — Railway log rate limit is ~100/s
-# and the client emits one INFO per query by default.
-logging.getLogger("clickhouse_connect").setLevel(logging.WARNING)
+# clickhouse-driver's INFO logger emits one line per query by default; cap to
+# WARNING so the Railway 100-msg/sec rate limit doesn't get blown by chatter
+# during a Kafka replay storm.
+logging.getLogger("clickhouse_driver").setLevel(logging.WARNING)
 
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -64,9 +70,9 @@ def status() -> dict:
 
 
 def _get_client():
-    """Lazy-build the client. Caches on success; on failure clears the cache
-    so the next call retries (transient connect errors shouldn't poison
-    the process for its lifetime)."""
+    """Lazy-build the Client. Caches on success; on failure clears the cache
+    so the next call retries (transient connect errors shouldn't poison the
+    process for its lifetime)."""
     global _client
     if _client is not None:
         return _client
@@ -74,38 +80,50 @@ def _get_client():
         if _client is not None:
             return _client
         try:
-            import clickhouse_connect  # type: ignore
+            from clickhouse_driver import Client  # type: ignore
         except ImportError:
-            _status["last_error"] = "clickhouse-connect not installed"
+            _status["last_error"] = "clickhouse-driver not installed"
             return None
         host = _env("CLICKHOUSE_HOST")
         if not host:
             _status["last_error"] = "CLICKHOUSE_HOST not set"
             return None
-        port = int(_env("CLICKHOUSE_PORT", "8123") or "8123")
+        # Native TCP port. backend-audit uses 9000 successfully against this
+        # cluster; HTTP (8123) auth is rejected.
+        port = int(_env("CLICKHOUSE_PORT", "9000") or "9000")
         user = _env("CLICKHOUSE_USERNAME", "default") or "default"
         password = _env("CLICKHOUSE_PASSWORD", "") or ""
         database = _env("CLICKHOUSE_DATABASE", "default") or "default"
         try:
-            _client = clickhouse_connect.get_client(
+            _client = Client(
                 host=host,
                 port=port,
-                username=user,
+                user=user,
                 password=password,
                 database=database,
+                # Don't pin secure=True — Railway-internal traffic doesn't go
+                # through TLS and TLS-on-internal is uncommon for CH. If we
+                # ever connect to a TLS-fronted CH we'll add it as an env.
                 connect_timeout=10,
                 send_receive_timeout=15,
+                # Keep one socket open for the process lifetime — we batch
+                # inserts and want low per-batch overhead.
+                settings={"use_numpy": False},
             )
+            # Force an early auth round-trip so we know connect is good
+            # before the first batch tries to flush.
+            _client.execute("SELECT 1")
             _status["configured"] = True
             _status["connected"] = True
             _status["last_error"] = ""
-            print(f"[ch] connected — {host}:{port} db={database}", flush=True)
+            print(f"[ch] connected — {host}:{port} db={database} user={user}", flush=True)
             return _client
         except Exception as e:  # noqa: BLE001
             _status["configured"] = True
             _status["connected"] = False
             _status["last_error"] = str(e)[:200]
             print(f"[ch] connect failed: {e}", flush=True)
+            _client = None
             return None
 
 
@@ -114,6 +132,11 @@ def _reset_client_on_error():
     transport-level error."""
     global _client
     with _client_lock:
+        try:
+            if _client is not None:
+                _client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
         _client = None
 
 
@@ -153,7 +176,7 @@ def ensure_schema() -> bool:
     if client is None:
         return False
     try:
-        client.command(SCHEMA_DDL)
+        client.execute(SCHEMA_DDL)
         print(f"[ch] schema ready — table {TABLE}", flush=True)
         return True
     except Exception as e:  # noqa: BLE001
@@ -166,7 +189,7 @@ def ensure_schema() -> bool:
 
 # ---------- writes -----------------------------------------------------------
 
-COLUMNS = [
+INSERT_COLUMNS = (
     "attempt_id",
     "event_time",
     "success",
@@ -177,14 +200,17 @@ COLUMNS = [
     "user_agent",
     "client_type",
     "failure_reason",
-]
+)
+INSERT_SQL = (
+    f"INSERT INTO {TABLE} ({', '.join(INSERT_COLUMNS)}) VALUES"
+)
 
 
-def _row_from_event(ev: dict) -> list:
+def _row_from_event(ev: dict) -> tuple:
     """Adapter from the dashboard's internal event shape to the CH row order
-    above. `ev` is what kafka_consumer._adapt() produced — see its docstring
-    for the canonical shape. Missing/null values are coerced to safe
-    defaults so a single bad message never poisons a batch."""
+    above. `ev` is what kafka_consumer._adapt() produced. Missing/null
+    values are coerced to safe defaults so a single bad message never
+    poisons a batch."""
     from datetime import datetime, timezone
     # event_time: prefer the source timestamp from tms-auth; fall back to now
     src = ev.get("source_ts")
@@ -196,7 +222,7 @@ def _row_from_event(ev: dict) -> list:
     else:
         event_time = datetime.now(tz=timezone.utc)
 
-    return [
+    return (
         str(ev.get("attempt_id") or ""),
         event_time,
         1 if ev.get("success") else 0,
@@ -207,7 +233,7 @@ def _row_from_event(ev: dict) -> list:
         str(ev.get("user_agent") or ""),
         str(ev.get("client_type") or ""),
         str(ev.get("failure_reason") or ""),
-    ]
+    )
 
 
 def insert_batch(events: list[dict]) -> bool:
@@ -226,7 +252,7 @@ def insert_batch(events: list[dict]) -> bool:
         return False
     rows = [_row_from_event(e) for e in events]
     try:
-        client.insert(TABLE, rows, column_names=COLUMNS)
+        client.execute(INSERT_SQL, rows)
         _status["last_insert_at"] = time.time()
         _status["rows_inserted"] += len(rows)
         _status["connected"] = True
@@ -246,8 +272,8 @@ def query_aggregates(window_s: int) -> list[dict]:
 
     Returns a list of dicts shaped like the legacy aggregates_snapshot()
     output so the HTTP handler / map JSON path doesn't need to change.
-    On any error: returns empty list and the caller will render
-    'No events yet.' — a stale read is worse than an empty read."""
+    On any error: returns empty list and the caller will fall back to
+    the in-memory deque — a stale read is worse than an empty read."""
     client = _get_client()
     if client is None:
         return []
@@ -256,7 +282,7 @@ def query_aggregates(window_s: int) -> list[dict]:
             ip,
             countIf(success = 1) AS ok,
             countIf(success = 0) AS fail,
-            max(event_time)      AS last_ts,
+            max(event_time)                AS last_ts,
             argMax(email, event_time)      AS last_user,
             argMax(user_agent, event_time) AS last_ua
         FROM {TABLE}
@@ -266,20 +292,19 @@ def query_aggregates(window_s: int) -> list[dict]:
         LIMIT 500
     """
     try:
-        result = client.query(sql)
+        rows = client.execute(sql)
         _status["last_query_at"] = time.time()
         _status["connected"] = True
         out = []
-        for row in result.result_rows:
-            ip, ok, fail, last_ts, last_user, last_ua = row
+        for ip, ok, fail, last_ts, last_user, last_ua in rows:
             out.append({
                 "ip": ip,
                 "ok": int(ok),
                 "fail": int(fail),
                 "last_user": last_user or "",
                 "last_ua": last_ua or "",
-                # Convert CH DateTime → unix float so the existing render
-                # code (which expects ev['ts'] as unix) works untouched.
+                # CH DateTime → unix float so existing render code (which
+                # expects ev['ts'] as unix) works untouched.
                 "last_ts": last_ts.timestamp() if last_ts is not None else 0.0,
             })
         return out
@@ -300,24 +325,17 @@ def query_recent(limit: int = 100) -> list[dict]:
     if client is None:
         return []
     sql = f"""
-        SELECT
-            event_time,
-            success,
-            email,
-            ip,
-            user_agent,
-            failure_reason
+        SELECT event_time, success, email, ip, user_agent, failure_reason
         FROM {TABLE}
         ORDER BY event_time DESC
         LIMIT {int(limit)}
     """
     try:
-        result = client.query(sql)
+        rows = client.execute(sql)
         _status["last_query_at"] = time.time()
         _status["connected"] = True
         out = []
-        for row in result.result_rows:
-            event_time, success, email, ip, user_agent, failure_reason = row
+        for event_time, success, email, ip, user_agent, failure_reason in rows:
             out.append({
                 "ts": event_time.timestamp() if event_time is not None else 0.0,
                 "success": bool(success),
@@ -342,8 +360,8 @@ def total_rows() -> int:
     if client is None:
         return 0
     try:
-        result = client.query(f"SELECT count() FROM {TABLE}")
-        return int(result.result_rows[0][0]) if result.result_rows else 0
+        rows = client.execute(f"SELECT count() FROM {TABLE}")
+        return int(rows[0][0]) if rows else 0
     except Exception as e:  # noqa: BLE001
         _status["last_error"] = str(e)[:200]
         return 0
