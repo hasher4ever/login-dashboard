@@ -72,6 +72,12 @@ def _post(query: str, variables: dict, jwt: Optional[str] = None) -> dict:
             "Content-Type": "application/json",
             "Accept": "application/json",
             "Authorization": f"Bearer {use_jwt}",
+            # Cloudflare's WAF (rule 1010) blocks the default Python-urllib
+            # User-Agent on api.tms360.io. Set an explicit UA so we're not
+            # on the bot signature list. Preferred path is still to point
+            # AUTH_GRAPHQL_URL at apollo.railway.internal so this never
+            # touches Cloudflare at all.
+            "User-Agent": "tms360-login-dashboard/1.0 (+railway-internal)",
         },
     )
     try:
