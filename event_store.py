@@ -259,14 +259,8 @@ def insert_batch(events: list[dict]) -> bool:
     historical writes (the in-memory deque + alert pipeline still works)."""
     if not events:
         return True
-    # Debug: log every entry to insert_batch so we can see if it's being
-    # invoked at all. Remove once the pipeline is observed healthy.
-    if _status["rows_inserted"] < 10:
-        print(f"[ch] insert_batch entered with {len(events)} events", flush=True)
     client = _get_client()
     if client is None:
-        if _status["rows_inserted"] < 10:
-            print("[ch] insert_batch: client is None, returning False", flush=True)
         return False
     rows = [_row_from_event(e) for e in events]
     try:

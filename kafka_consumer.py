@@ -158,12 +158,7 @@ def _flush_batch(batch: list[dict]) -> None:
     independent of CH being up."""
     if not batch:
         return
-    configured = event_store.ch_configured()
-    # Diag (capped) — prove _flush_batch is being entered + the ch_configured
-    # check passes. Caps at 5 prints so it doesn't fill the log forever.
-    if status()["messages_seen"] < 50:
-        print(f"[kafka] _flush_batch n={len(batch)} ch_configured={configured}", flush=True)
-    if configured:
+    if event_store.ch_configured():
         event_store.insert_batch(batch)
 
 
@@ -191,60 +186,51 @@ def _consume_loop(on_event: Callable[[dict], None]) -> None:
                 flush=True,
             )
             backoff = 1.0
-            for msg in consumer:
-                try:
-                    payload = msg.value
-                    if not isinstance(payload, dict):
-                        continue
-                    ev = _adapt(payload)
-                    on_event(ev)
-                    batch.append(ev)
-                    seen_before = status()["messages_seen"]
-                    _set(
-                        last_message_at=time.time(),
-                        messages_seen=seen_before + 1,
-                    )
-                    # Per-event log so "did anything flow through" is answerable
-                    # without an in-browser test. Compact; success/failure +
-                    # email + ip is enough for visual scanning. The first
-                    # message gets an extra prefix so the "wiring works" moment
-                    # is unmistakable in the log stream.
-                    verdict = "OK" if ev["success"] else f"FAIL/{ev.get('failure_reason') or 'unknown'}"
-                    prefix = "[kafka] first event! " if seen_before == 0 else "[kafka] ingest "
-                    print(
-                        f"{prefix}{verdict} email={ev['username']!r} ip={ev['ip']}",
-                        flush=True,
-                    )
-                except Exception as e:  # noqa: BLE001 — keep the loop alive on bad payloads
-                    print(f"[kafka] bad message dropped: {e}", flush=True)
+            poll_timeout_ms = int(BATCH_MAX_AGE_S * 1000)
+            while True:
+                # poll() returns {TopicPartition: [messages]}; empty dict
+                # when nothing arrived within the timeout. We still fall
+                # through to the flush check after the poll returns, so the
+                # age cap fires during quiet periods. The earlier
+                # `for msg in consumer:` form stalled the flush until the
+                # next message arrived — under sparse traffic that meant
+                # the batch sat in memory minutes at a time.
+                fetched = consumer.poll(
+                    timeout_ms=poll_timeout_ms,
+                    max_records=BATCH_MAX_ROWS,
+                )
+                for tp_msgs in fetched.values():
+                    for msg in tp_msgs:
+                        try:
+                            payload = msg.value
+                            if not isinstance(payload, dict):
+                                continue
+                            ev = _adapt(payload)
+                            on_event(ev)
+                            batch.append(ev)
+                            seen_before = status()["messages_seen"]
+                            _set(
+                                last_message_at=time.time(),
+                                messages_seen=seen_before + 1,
+                            )
+                            verdict = "OK" if ev["success"] else f"FAIL/{ev.get('failure_reason') or 'unknown'}"
+                            prefix = "[kafka] first event! " if seen_before == 0 else "[kafka] ingest "
+                            print(
+                                f"{prefix}{verdict} email={ev['username']!r} ip={ev['ip']}",
+                                flush=True,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            print(f"[kafka] bad message dropped: {e}", flush=True)
 
-                # Flush if the batch hit its row cap or its age cap
+                # Flush check — runs after every poll(), so the age cap
+                # fires even when the last poll returned no messages.
                 now_ts = time.time()
-                age = now_ts - last_flush
-                size_ok = len(batch) >= BATCH_MAX_ROWS
-                age_ok = bool(batch) and age >= BATCH_MAX_AGE_S
-                # Diag: log every checkpoint at batch milestones until we
-                # observe one successful flush.
-                seen = status()["messages_seen"]
-                # Brute-force diag: every 25th event + every flush trigger
-                if seen <= 5 or seen % 25 == 0 or size_ok or age_ok:
-                    print(
-                        f"[kafka] flush-check seen={seen} len(batch)={len(batch)} "
-                        f"age={age:.3f}s size_ok={size_ok} age_ok={age_ok}",
-                        flush=True,
-                    )
-                if size_ok or age_ok:
+                if len(batch) >= BATCH_MAX_ROWS or (
+                    batch and now_ts - last_flush >= BATCH_MAX_AGE_S
+                ):
                     _flush_batch(batch)
                     batch = []
                     last_flush = now_ts
-            # Defensive: if the iterator exits without raising (shouldn't
-            # happen with the default infinite timeout, but guard anyway so
-            # we can never tight-loop), sleep before reconnecting.
-            _flush_batch(batch)
-            batch = []
-            _set(connected=False, last_error="iterator returned cleanly")
-            print("[kafka] iterator exited cleanly — pausing 5s before reconnect", flush=True)
-            time.sleep(5)
         except Exception as e:  # noqa: BLE001
             _flush_batch(batch)
             batch = []
