@@ -66,6 +66,40 @@ get the canned demo buttons.
 | `CLICKHOUSE_DATABASE` | `default` | Database that holds the `security_auth_events` table. |
 | `CLICKHOUSE_USERNAME` | `default` | |
 | `CLICKHOUSE_PASSWORD` | _(unset)_ | |
+| `MAXMIND_LICENSE_KEY` | _(unset)_ | Enables the **geolite2** GeoIP backend. Free key from `https://www.maxmind.com/en/geolite2/signup`. Without it, only DB-IP (and IP2Location if configured) appear in the selector. |
+| `IP2LOCATION_TOKEN` | _(unset)_ | Enables the **ip2location** GeoIP backend. Free token from `https://lite.ip2location.com/`. |
+| `GEO_DEFAULT_BACKEND` | `ensemble` | First-pick backend for new sessions. Operators override per-browser via the header selector (persisted in localStorage). |
+| `GEO_REFRESH_DISABLED` | `false` | Set to `true` to stop the in-process refresher daemon. Useful for tests or when running fresh DBs in from a sidecar. |
+| `GEO_REFRESH_INTERVAL_S` | `3600` | How often the daemon re-checks each backend's age. Each backend has its own staleness threshold matching the upstream cadence; this is just the polling interval. |
+
+## Geolocation backends
+
+The Map tab resolves every IP into `(lat, lng, label)` against one of three
+free, **DB-only** (no runtime API call) geolocation databases. Pick the one
+to use from the header dropdown (`geo: <name>`); the choice is persisted
+per-browser in localStorage.
+
+| Backend | Source | License | Format | Upstream cadence | Auth |
+|---|---|---|---|---|---|
+| `geolite2` | MaxMind GeoLite2-City | CC BY-SA 4.0 | MMDB | twice weekly (Tue / Fri) | needs `MAXMIND_LICENSE_KEY` |
+| `dbip` | DB-IP City Lite | CC BY 4.0 | MMDB | monthly (1st) | none |
+| `ip2location` | IP2Location LITE DB11 | CC BY-SA 4.0 | BIN | monthly (1st) | needs `IP2LOCATION_TOKEN` |
+| `ensemble` | majority vote across whichever of the above are loaded | — | — | — | — |
+
+`ensemble` mode runs every loaded backend, keys results by `(city, country)`,
+and picks the answer ≥2 backends agree on. Ties break by precedence
+`ip2location > dbip > geolite2` (their relative city-coverage ranking per
+APNIC's measurement study). Total disagreement falls back to the same
+precedence list.
+
+DBs are refreshed in-process by `geo_refresh.py` — a daemon thread that
+re-runs the per-backend setup script on the upstream's publishing cadence.
+A successful refresh hot-reloads the reader and evicts cached lookups; no
+process restart needed. Missing auth env vars cause that backend to be
+skipped silently (the selector shows it as `(not loaded)`).
+
+To check live status: `GET /api/geo-backends` (requires signin) returns
+the load state, file mtime, and cadence of every backend.
 
 ## Auth-service contract (per DEV-660)
 

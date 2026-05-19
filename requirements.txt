@@ -1,4 +1,8 @@
 maxminddb>=2.6.0
+# IP2Location LITE DB11 reader. Loaded by geo.py's IP2Location backend; pure
+# Python so no build-time deps. The DB BIN itself is fetched by
+# scripts/setup_ip2location.sh (needs IP2LOCATION_TOKEN).
+IP2Location>=8.10
 kafka-python>=2.0.2
 # tms-auth's Kafka producer compresses with snappy; kafka-python imports the
 # `snappy` module on demand. python-snappy provides it. Needs libsnappy-dev

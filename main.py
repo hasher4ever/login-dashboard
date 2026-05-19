@@ -22,7 +22,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
-from geo import geolocate
+from geo import geolocate, available_backends
+import geo_refresh
 from scenarios import SCENARIOS
 import kafka_consumer
 import graphql_client
@@ -358,6 +359,18 @@ def _scenarios_bar() -> str:
   </div>"""
 
 
+def _geo_picker() -> str:
+    """Bootstraps an empty <select> for GeoIP source. Options are populated
+    by JS on load from /api/geo-backends so disabled / not-loaded backends
+    show as greyed-out without round-tripping cookies. Choice is persisted
+    in localStorage and appended as ?geo= to every marker / feed fetch."""
+    return (
+        '<select id="geo-picker" class="window-picker" title="GeoIP source — pick the database the map should resolve IPs against" onchange="setGeoBackend(this.value)">'
+        '<option value="ensemble">geo: ensemble</option>'
+        "</select>"
+    )
+
+
 def _window_picker(current: int) -> str:
     """Compact <select> rendered in the header. Pre-selects whichever preset
     matches the current cookie value; falls back to showing the literal
@@ -422,6 +435,7 @@ def render_page(
     {_source_banner(session)}
   </div>
   <div class="header-controls">
+    {_geo_picker()}
     {_window_picker(window_s)}
     {_scenarios_bar()}
   </div>
@@ -532,8 +546,13 @@ def render_live_panel() -> str:
     return _wrap("live", inner)
 
 
-def feed_json() -> str:
-    """JSON payload for the side feed: most recent events, newest first."""
+def feed_json(geo_backend: Optional[str] = None) -> str:
+    """JSON payload for the side feed: most recent events, newest first.
+
+    `geo_backend` is unused today (the side-feed doesn't carry a location
+    column) but accepted for symmetry with map_markers_json so the route
+    layer can pass `?geo=` through uniformly."""
+    _ = geo_backend  # reserved for when we surface per-row geo in the feed
     snap = _recent_events(80)
     if event_store.ch_configured() and event_store.status()["connected"]:
         total = event_store.total_rows()
@@ -551,12 +570,13 @@ def feed_json() -> str:
     return json.dumps({"events": out, "total": total})
 
 
-def map_markers_json(window_s: int = DEFAULT_WINDOW_S) -> str:
+def map_markers_json(window_s: int = DEFAULT_WINDOW_S, geo_backend: Optional[str] = None) -> str:
     """JSON payload for the Map tab. Pure data, no HTML.
 
     Reuses aggregates_snapshot so the source-of-truth (ClickHouse with
     deque fallback) lives in one place. Adds geo + color/status classes
-    needed for Leaflet rendering."""
+    needed for Leaflet rendering. `geo_backend` picks which GeoIP DB to
+    resolve each IP against — see geo.py."""
     n = now()
     with state_lock:
         ban_map = dict(bans)
@@ -567,7 +587,7 @@ def map_markers_json(window_s: int = DEFAULT_WINDOW_S) -> str:
     markers = []
     for r in rows:
         ip = r["ip"]
-        lat, lng, label = geolocate(ip)
+        lat, lng, label = geolocate(ip, backend=geo_backend)
         if ip in allow:
             color, status = "#6cdb8c", "allowlisted"
         elif ip in block:
@@ -1037,7 +1057,7 @@ function refreshMarkers() {
   if (!_mapInstance || !_markerLayer) return;
   if (_popupOpen) return;  // don't clobber an open popup with a marker refresh
   _lastMapRefresh = Date.now();
-  fetch('/api/map-markers').then(function(r) { return r.json(); }).then(function(data) {
+  fetch('/api/map-markers?geo=' + encodeURIComponent(_geoBackend())).then(function(r) { return r.json(); }).then(function(data) {
     _markerLayer.clearLayers();
     // Rebuild the IP -> marker index so side-feed click-to-zoom can find
     // the right circle marker after every refresh tick.
@@ -1073,7 +1093,7 @@ function focusMapOn(ip) {
 }
 
 function refreshSideFeed() {
-  fetch('/api/feed').then(function(r) { return r.json(); }).then(function(data) {
+  fetch('/api/feed?geo=' + encodeURIComponent(_geoBackend())).then(function(r) { return r.json(); }).then(function(data) {
     var host = document.getElementById('feed-side');
     if (!host) return;
     if (!data.events.length) {
@@ -1120,7 +1140,67 @@ document.addEventListener('DOMContentLoaded', function() {
     var activeBtn = document.querySelector('nav.tabs .tab.active');
     if (activeBtn) showMap(activeBtn);
   }
+  populateGeoPicker();
 });
+
+// ----- GeoIP backend selector ----------------------------------------------
+// User picks which GeoIP database the map resolves IPs against. Choice is
+// localStorage-persisted (not a cookie — purely a render-time hint, no need
+// to ship it to every request that isn't a map fetch). Selector is populated
+// from /api/geo-backends so backends without a downloaded DB show up disabled
+// with a "(not loaded)" suffix instead of silently 404ing the operator.
+
+function _geoBackend() {
+  try {
+    return localStorage.getItem('geo_backend') || 'ensemble';
+  } catch (e) {
+    return 'ensemble';
+  }
+}
+
+function setGeoBackend(v) {
+  try { localStorage.setItem('geo_backend', v); } catch (e) {}
+  // Map + side feed re-resolve every IP against the new DB. Don't reload
+  // the page — Leaflet state would be torn down for nothing.
+  if (document.querySelector('main').classList.contains('show-map')) {
+    refreshMarkers();
+    refreshSideFeed();
+  }
+}
+
+function populateGeoPicker() {
+  var sel = document.getElementById('geo-picker');
+  if (!sel) return;
+  fetch('/api/geo-backends').then(function(r) {
+    if (!r.ok) throw new Error('geo-backends ' + r.status);
+    return r.json();
+  }).then(function(data) {
+    var saved = _geoBackend();
+    var html = '';
+    data.backends.forEach(function(b) {
+      // Short label for the chip: "geo: dbip · 4d old" / "geo: geolite2 (not loaded)".
+      var ageStr = '';
+      if (b.mtime) {
+        var days = Math.floor((Date.now() / 1000 - b.mtime) / 86400);
+        ageStr = ' · ' + days + 'd old';
+      }
+      var suffix = b.available ? ageStr : ' (not loaded)';
+      var disabled = b.available ? '' : ' disabled';
+      var selected = (b.name === saved && b.available) ? ' selected' : '';
+      html += '<option value="' + b.name + '"' + disabled + selected + '>'
+            + 'geo: ' + b.name + suffix + '</option>';
+    });
+    sel.innerHTML = html;
+    // If the saved choice is now unloaded, fall back to whatever ended up
+    // selected (the server's resolution order picks the best available).
+    if (sel.value && sel.value !== saved) {
+      try { localStorage.setItem('geo_backend', sel.value); } catch (e) {}
+    }
+  }).catch(function() {
+    // /api/geo-backends 401 / 5xx: leave the bootstrap "ensemble" option
+    // alone. Picker still works, just no live status info.
+  });
+}
 """
 
 
@@ -1604,6 +1684,15 @@ class H(BaseHTTPRequestHandler):
             return DEFAULT_WINDOW_S
         return n
 
+    def _geo_backend(self) -> Optional[str]:
+        """Read the operator's GeoIP source pick from `?geo=` query param.
+        FE stores its choice in localStorage and appends it to every
+        /api/map-markers and /api/feed call. Unknown values fall through
+        to geo.py's resolution (which silently picks the best loaded DB)."""
+        qs = parse_qs(urlparse(self.path).query)
+        val = (qs.get("geo") or [None])[0]
+        return val.strip() if isinstance(val, str) and val.strip() else None
+
     def _client_ip(self) -> str:
         """Originating client IP. Railway / any reverse proxy puts the real
         client first in X-Forwarded-For; fall back to the socket peer when
@@ -1669,9 +1758,23 @@ class H(BaseHTTPRequestHandler):
         if path == "/partials/live":
             return self._send(200, render_live_panel())
         if path == "/api/map-markers":
-            return self._send(200, map_markers_json(self._window_s()), "application/json")
+            return self._send(
+                200,
+                map_markers_json(self._window_s(), geo_backend=self._geo_backend()),
+                "application/json",
+            )
         if path == "/api/feed":
-            return self._send(200, feed_json(), "application/json")
+            return self._send(
+                200,
+                feed_json(geo_backend=self._geo_backend()),
+                "application/json",
+            )
+        if path == "/api/geo-backends":
+            return self._send(
+                200,
+                json.dumps({"backends": available_backends()}),
+                "application/json",
+            )
         if path == "/partials/bans":
             return self._send(200, render_bans_panel())
         if path == "/events":
@@ -1915,6 +2018,7 @@ def main():
         event_store.ensure_schema()
 
     threading.Thread(target=ban_sweeper, daemon=True).start()
+    geo_refresh.start_daemon()
     kafka_consumer.start(ingest_event)
     # Always start rule-sync — it self-gates on JWT availability and short-polls
     # until an operator signs in. This way the Bans tab hydrates as soon as the
