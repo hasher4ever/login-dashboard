@@ -158,7 +158,12 @@ def _flush_batch(batch: list[dict]) -> None:
     independent of CH being up."""
     if not batch:
         return
-    if event_store.ch_configured():
+    configured = event_store.ch_configured()
+    # Diag (capped) — prove _flush_batch is being entered + the ch_configured
+    # check passes. Caps at 5 prints so it doesn't fill the log forever.
+    if status()["messages_seen"] < 50:
+        print(f"[kafka] _flush_batch n={len(batch)} ch_configured={configured}", flush=True)
+    if configured:
         event_store.insert_batch(batch)
 
 
