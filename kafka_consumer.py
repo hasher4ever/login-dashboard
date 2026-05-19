@@ -226,10 +226,11 @@ def _consume_loop(on_event: Callable[[dict], None]) -> None:
                 # Diag: log every checkpoint at batch milestones until we
                 # observe one successful flush.
                 seen = status()["messages_seen"]
-                if seen in (1, 5, 50, 100, 190, 199, 200, 201, 300) or size_ok or age_ok:
+                if seen in (1, 5, 50, 100, 200, 300) or size_ok or age_ok:
                     print(
                         f"[kafka] flush-check seen={seen} len(batch)={len(batch)} "
-                        f"age={age:.3f}s size_ok={size_ok} age_ok={age_ok}",
+                        f"now={now_ts:.6f} last_flush={last_flush:.6f} age={age:.6f}s "
+                        f"size_ok={size_ok} age_ok={age_ok}",
                         flush=True,
                     )
                 if size_ok or age_ok:
