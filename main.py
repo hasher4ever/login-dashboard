@@ -656,17 +656,33 @@ def _render_alerts(cur_alerts: list[dict]) -> str:
 def _render_feed(feed: list[dict]) -> str:
     if not feed:
         return '<p class="muted">Feed is empty.</p>'
+    # Compute current ban/allow/block status per row so the action menu in
+    # each feed entry can offer the right next step (Unban vs Ban, etc.) —
+    # makes Live tab fully interoperable with IPs/Bans tabs.
+    n = now()
+    with state_lock:
+        ban_map = dict(bans)
+        allow = dict(allowlist)
+        block = dict(blocklist)
     body = []
     for e in feed:
         cls = "ok" if e["success"] else "fail"
+        ip = e["ip"]
+        status, status_label = _classify(ip, ban_map, allow, block, n)
+        action_cell = _render_action_cell({
+            "ip": ip,
+            "status": status,
+            "status_label": status_label,
+        })
         body.append(f"""
 <tr class="feed-{cls}">
   <td class="ts">{iso(e["ts"])}</td>
   <td class="verdict">{'OK  ' if e["success"] else 'FAIL'}</td>
-  <td class="ip">{html.escape(e["ip"])}</td>
+  <td class="ip">{html.escape(ip)}</td>
   <td>{html.escape(e["username"])}</td>
   <td class="ua">{html.escape(_short_ua(e["user_agent"]))}</td>
   <td class="muted">{html.escape(e.get("failure_reason") or "")}</td>
+  <td class="actions">{action_cell}</td>
 </tr>""")
     return f"<table class='feed'><tbody>{''.join(body)}</tbody></table>"
 
@@ -769,14 +785,28 @@ def _short_ua(ua: str) -> str:
 
 MAP_JS = """
 function setWindow(v) {
-  // Year-long cookie so the choice survives reloads. SameSite=Lax matches
-  // the session cookie. Secure is set when we're on https; Railway is
-  // always https in prod, so this is fine.
+  // In-session cookie: same path/SameSite as the session cookie. NOT a
+  // full-page reload — the server force-resets this to 5m on every GET /,
+  // so reloading would just flip back to the default and confuse the user.
+  // Instead we refresh the active panels in-place so the new window takes
+  // effect immediately without losing the picker selection.
   var secure = (location.protocol === 'https:') ? '; Secure' : '';
   document.cookie = 'dashboard_window=' + encodeURIComponent(v) +
     '; path=/; max-age=' + (60 * 60 * 24 * 365) +
     '; SameSite=Lax' + secure;
-  location.reload();
+
+  // Map view: kick the marker + side-feed fetches directly (they're not
+  // HTMX-managed). Then nudge the HTMX-managed content panel to refetch
+  // by firing a synthetic sse:update — same trigger the panels already
+  // listen for, so no per-tab routing logic needed.
+  if (document.querySelector('main').classList.contains('show-map')) {
+    refreshMarkers();
+    refreshSideFeed();
+  }
+  var content = document.getElementById('content');
+  if (content && typeof htmx !== 'undefined') {
+    htmx.trigger(content, 'sse:update');
+  }
 }
 
 let _mapInstance = null;
@@ -957,19 +987,37 @@ function refreshMarkers() {
   _lastMapRefresh = Date.now();
   fetch('/api/map-markers').then(function(r) { return r.json(); }).then(function(data) {
     _markerLayer.clearLayers();
+    // Rebuild the IP -> marker index so side-feed click-to-zoom can find
+    // the right circle marker after every refresh tick.
+    window._markersByIp = {};
     data.markers.forEach(function(m) {
       var radius = Math.max(7, Math.min(22, 6 + (m.ok + m.fail) * 1.5));
-      L.circleMarker([m.lat, m.lng], {
+      var marker = L.circleMarker([m.lat, m.lng], {
         radius: radius,
         color: m.color,
         weight: 2,
         fillColor: m.color,
         fillOpacity: 0.45,
       }).bindPopup(_popupHtml(m)).addTo(_markerLayer);
+      window._markersByIp[m.ip] = marker;
     });
     var stat = document.getElementById('map-stat');
     if (stat) stat.textContent = '(' + data.markers.length + ' unique IPs · last ' + data.window_label + ')';
   });
+}
+
+function focusMapOn(ip) {
+  // Side-feed entries delegate to this on click. flyTo + openPopup the
+  // existing circleMarker; no separate geo lookup needed. Silent no-op
+  // when the IP isn't on the map (event outside the window, private IP,
+  // etc.) — caller can widen the window picker if they need to see it.
+  if (!_mapInstance) return;
+  var m = (window._markersByIp || {})[ip];
+  if (!m) return;
+  _mapInstance.flyTo(m.getLatLng(), 15, {duration: 0.6});
+  // openPopup races the flyTo animation if called immediately, so defer
+  // just past the animation duration.
+  setTimeout(function() { m.openPopup(); }, 650);
 }
 
 function refreshSideFeed() {
@@ -982,11 +1030,14 @@ function refreshSideFeed() {
       var rows = data.events.map(function(e) {
         var verdict = e.success ? 'OK' : 'FAIL';
         var cls = e.success ? 'ok' : 'fail';
+        var ipSafe = _escape(e.ip);
         return (
-          '<div class="feed-row feed-' + cls + '">' +
+          '<div class="feed-row feed-' + cls + '" ' +
+               'onclick="focusMapOn(\\'' + ipSafe + '\\')" ' +
+               'title="Click to focus map on ' + ipSafe + '">' +
             '<span class="t">' + _escape(e.ts) + '</span>' +
             '<span class="v">' + verdict + '</span>' +
-            '<span class="ip">' + _escape(e.ip) + '</span>' +
+            '<span class="ip">' + ipSafe + '</span>' +
             '<span class="u">' + _escape(e.username) + '</span>' +
           '</div>'
         );
@@ -1251,7 +1302,10 @@ body { overflow: hidden; }  /* page must fit viewport; no scroll */
   padding: 4px 8px; border-bottom: 1px solid #1a2027;
   font-size: 11px; line-height: 1.4; flex: 0 0 auto;
   white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.1s ease;
 }
+.feed-row:hover { background: rgba(108, 178, 255, 0.08); }
 .feed-row > * { overflow: hidden; text-overflow: ellipsis; }
 .feed-row .t { color: #687080; font-variant-numeric: tabular-nums; }
 .feed-row .v { font-weight: 600; }
@@ -1460,6 +1514,20 @@ class H(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _send_with_cookie(self, status: int, body: str, set_cookie: str,
+                          ctype: str = "text/html; charset=utf-8") -> None:
+        data = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Set-Cookie", set_cookie)
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _form(self) -> dict[str, str]:
         ln = int(self.headers.get("Content-Length", "0") or "0")
         raw = self.rfile.read(ln).decode() if ln else ""
@@ -1530,7 +1598,18 @@ class H(BaseHTTPRequestHandler):
         if path == "/logout":
             return self._redirect("/signin", set_cookie=auth_session.clear_cookie())
         if path == "/":
-            return self._send(200, render_page(self._session(), self._window_s()))
+            # Full page loads always start on the default (5 min) window,
+            # regardless of what the cookie remembered. Two reasons:
+            # (a) avoid a heavy 24h replay aggregation on every refresh;
+            # (b) make the dashboard's "first impression" predictable.
+            # In-session refreshes (HTMX partials, /api/*) keep honoring
+            # the cookie so user dropdown picks still work without reload.
+            secure = "" if COOKIE_INSECURE else "; Secure"
+            return self._send_with_cookie(
+                200,
+                render_page(self._session(), DEFAULT_WINDOW_S),
+                f"{WINDOW_COOKIE}={DEFAULT_WINDOW_S}; Path=/; Max-Age={365*24*3600}; SameSite=Lax{secure}",
+            )
         if path == "/partials/ips":
             return self._send(200, render_ips_panel(self._window_s()))
         if path == "/partials/alerts":
