@@ -61,6 +61,11 @@ get the canned demo buttons.
 | `AUTH_SIGNIN_URL` | `https://auth.tms360.io/api/auth/signin` | REST signin endpoint. Override only if it moves. |
 | `AUTH_JWT` | _(unset)_ | Optional service token. If set, the rule-sync hydration loop runs even before any operator signs in. Mutations always prefer the signed-in operator's JWT. |
 | `COOKIE_INSECURE` | `false` | Set to `true` only for local `http://` dev so the session cookie is set without the Secure flag. |
+| `CLICKHOUSE_HOST` | _(unset)_ | ClickHouse hostname. Without it, the dashboard runs in deque-only mode — long windows (>5 min) show nothing. |
+| `CLICKHOUSE_PORT` | `8123` | HTTP port. |
+| `CLICKHOUSE_DATABASE` | `default` | Database that holds the `security_auth_events` table. |
+| `CLICKHOUSE_USERNAME` | `default` | |
+| `CLICKHOUSE_PASSWORD` | _(unset)_ | |
 
 ## Auth-service contract (per DEV-660)
 
@@ -116,14 +121,33 @@ The included Dockerfile downloads a DB-IP City Lite MMDB at build time so the
 Map tab works without runtime setup. If the download fails, real IPs fall
 back to "unknown location" and everything else still works.
 
+## Persistence
+
+When `CLICKHOUSE_HOST` is set, every event is written to a `security_auth_events`
+table (created idempotently on boot, `ReplacingMergeTree`, partitioned by
+month, **TTL 90 days**). All UI read paths (IPs / Map / Live) query CH so
+long windows work without depending on Kafka retention or the in-memory
+buffer size. The in-memory deque shrinks to 1k events and is used only for
+real-time alert rules (brute_force / cred_stuffing / geo_anomaly recompute
+on every ingest — far too hot to hammer a DB).
+
+If CH is unreachable, the dashboard degrades — not goes down — to deque-only:
+the 5-minute view and alerts keep working, long-window queries return empty
+until CH is back. Writes during the outage are dropped (we don't buffer
+indefinitely); on recovery the Kafka replay path (`auto_offset_reset=earliest`)
+fills CH from whatever Kafka still retains.
+
 ## What's NOT shipped
 
 - No alert rules beyond the three already in `main.py` (brute_force,
   cred_stuffing, geo_anomaly). Tuning thresholds happens in code.
 - No JWT refresh loop — when a signed-in operator's token expires, they're
   bounced to /signin and sign in again. No silent re-auth.
-- No persistence on the dashboard side — events are an in-memory ring buffer;
-  Kafka is the source of truth, restart pulls fresh.
+- No ClickHouse Kafka-engine + materialized view (phase 2 — would let
+  ClickHouse subscribe to `auth_events` directly and the dashboard become
+  a pure query layer, but requires CH admin to provision the engine tables).
+- No pre-aggregated rollup tables — raw events only. Add rollups if long-
+  window queries get slow.
 
 ## Files
 
@@ -131,7 +155,8 @@ back to "unknown location" and everything else still works.
 |---|---|
 | `main.py` | HTTP server, SSE, aggregator, alert rules, HTML render, session gate |
 | `auth_session.py` | TMS360 signin proxy + JWT parsing + cookie helpers |
-| `kafka_consumer.py` | Background thread that ingests `auth_events` |
+| `kafka_consumer.py` | Background thread that ingests `auth_events` + batches inserts to CH |
+| `event_store.py` | ClickHouse client: schema, batch insert, window queries |
 | `graphql_client.py` | Minimal client for the 5 ipAccessRules operations |
 | `geo.py` | MMDB lookup + scenario IP overrides |
 | `scenarios.py` | Canned demo event streams (gated by `ENABLE_SCENARIOS=true`) |

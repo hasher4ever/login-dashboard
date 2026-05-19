@@ -43,6 +43,8 @@ import time
 import uuid
 from typing import Callable, Optional
 
+import event_store
+
 # Silence kafka-python's chatty internal loggers — Railway's deployment log
 # rate limit is ~100 msgs/sec and the library's INFO/DEBUG level happily
 # floods past that during reconnects.
@@ -139,9 +141,42 @@ def _build_consumer():
     return KafkaConsumer(topic, **kw)
 
 
+# Batch parameters for the ClickHouse insert path. Tuned for "low signin
+# volume most of the time, occasional bursts during attacks":
+#   - flush every BATCH_MAX_ROWS events so a steady high-rate stream still
+#     ships rows promptly (no unbounded buffer growth)
+#   - flush every BATCH_MAX_AGE_S seconds so a trickle of 1-2 signins/min
+#     doesn't sit in memory for hours before reaching CH
+BATCH_MAX_ROWS = 200
+BATCH_MAX_AGE_S = 0.5
+
+
+def _flush_batch(batch: list[dict]) -> None:
+    """Ship a batch to CH (if configured) and clear the buffer. Errors are
+    swallowed inside event_store.insert_batch — caller need not handle
+    failure here; the dashboard's in-memory deque + alert pipeline are
+    independent of CH being up."""
+    if not batch:
+        return
+    if event_store.ch_configured():
+        event_store.insert_batch(batch)
+
+
 def _consume_loop(on_event: Callable[[dict], None]) -> None:
-    """Run forever — reconnect on any error after a short backoff."""
+    """Run forever — reconnect on any error after a short backoff.
+
+    Each message is fanned out to:
+      1) `on_event(ev)` — the in-process deque + alert recomputation
+         (kept hot so brute_force / cred_stuffing alerts run real-time)
+      2) the CH batch buffer — flushed every BATCH_MAX_ROWS events or
+         BATCH_MAX_AGE_S seconds (whichever first)
+
+    CH writes are best-effort: a CH outage doesn't stop the dashboard from
+    serving the 5-minute in-memory view. Long-window queries (>5m) will
+    return empty during the outage but the rest of the UI keeps working."""
     backoff = 1.0
+    batch: list[dict] = []
+    last_flush = time.time()
     while True:
         try:
             consumer = _build_consumer()
@@ -158,6 +193,7 @@ def _consume_loop(on_event: Callable[[dict], None]) -> None:
                         continue
                     ev = _adapt(payload)
                     on_event(ev)
+                    batch.append(ev)
                     seen_before = status()["messages_seen"]
                     _set(
                         last_message_at=time.time(),
@@ -176,13 +212,26 @@ def _consume_loop(on_event: Callable[[dict], None]) -> None:
                     )
                 except Exception as e:  # noqa: BLE001 — keep the loop alive on bad payloads
                     print(f"[kafka] bad message dropped: {e}", flush=True)
+
+                # Flush if the batch hit its row cap or its age cap
+                now_ts = time.time()
+                if len(batch) >= BATCH_MAX_ROWS or (
+                    batch and now_ts - last_flush >= BATCH_MAX_AGE_S
+                ):
+                    _flush_batch(batch)
+                    batch = []
+                    last_flush = now_ts
             # Defensive: if the iterator exits without raising (shouldn't
             # happen with the default infinite timeout, but guard anyway so
             # we can never tight-loop), sleep before reconnecting.
+            _flush_batch(batch)
+            batch = []
             _set(connected=False, last_error="iterator returned cleanly")
             print("[kafka] iterator exited cleanly — pausing 5s before reconnect", flush=True)
             time.sleep(5)
         except Exception as e:  # noqa: BLE001
+            _flush_batch(batch)
+            batch = []
             _set(connected=False, last_error=str(e))
             print(f"[kafka] disconnected: {e} — retry in {backoff:.0f}s", flush=True)
             time.sleep(backoff)

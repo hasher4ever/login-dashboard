@@ -27,13 +27,18 @@ from scenarios import SCENARIOS
 import kafka_consumer
 import graphql_client
 import auth_session
+import event_store
 
 PORT = int(os.environ.get("PORT", "8000"))
 ENABLE_SCENARIOS = os.environ.get("ENABLE_SCENARIOS", "").lower() in ("1", "true", "yes")
 # Set COOKIE_INSECURE=true only when running on plain http:// (local dev). On
 # Railway the default Secure flag is what we want.
 COOKIE_INSECURE = os.environ.get("COOKIE_INSECURE", "").lower() in ("1", "true", "yes")
-BUFFER_SIZE = 10000        # event ring buffer — caps how much history any window can show
+# Buffer is now alerts-only: just enough to hold the longest alert window
+# (geo_anomaly = 5 min). All read paths for the UI go to ClickHouse via
+# event_store. 1 k events covers ~33 events/sec of steady traffic for the
+# 5-min window, which is well above realistic signin volume.
+BUFFER_SIZE = 1000
 RULES_REFRESH_S = 30       # how often to re-pull ipAccessRules from tms-auth
 ALERT_WINDOW_S = {
     "brute_force": 30,
@@ -238,12 +243,32 @@ def fmt_window(seconds: int) -> str:
 
 
 def aggregates_snapshot(window_s: int) -> list[dict]:
+    """Per-IP aggregates for the IPs and Map tabs.
+
+    Primary source: ClickHouse via event_store.query_aggregates — gives us
+    long windows (24h / 7d / 90d) without depending on Kafka retention.
+
+    Fallback: the in-memory deque, used when CH isn't configured (local
+    dev) or unhealthy. The deque only holds ~5 min of events post-refactor,
+    so this fallback is effectively "show what's flowed through since
+    process start" — fine for liveness, not for historical queries."""
     n = now()
     with state_lock:
-        recent = [e for e in events if n - e["ts"] <= window_s]
         ban_map = dict(bans)
         allow = dict(allowlist)
         block = dict(blocklist)
+
+    if event_store.ch_configured():
+        rows = event_store.query_aggregates(window_s)
+        if rows:
+            for r in rows:
+                r["status"], r["status_label"] = _classify(r["ip"], ban_map, allow, block, n)
+            return rows
+        # CH returned empty (legitimately empty OR transient error) — fall
+        # through to the deque so the UI doesn't go blank during a CH blip.
+
+    with state_lock:
+        recent = [e for e in events if n - e["ts"] <= window_s]
     by_ip: dict[str, dict] = {}
     for e in recent:
         row = by_ip.setdefault(e["ip"], {
@@ -280,7 +305,7 @@ TAB_DEFS = [
 
 
 def _source_banner(session: Optional[dict] = None) -> str:
-    """Header pills: Kafka source state + auth-sync state + signed-in user."""
+    """Header pills: Kafka source state + auth-sync state + CH state + signed-in user."""
     k = kafka_consumer.status()
     parts = []
     if kafka_consumer.kafka_configured():
@@ -291,6 +316,18 @@ def _source_banner(session: Optional[dict] = None) -> str:
             parts.append(f'<span class="tag tag-warn">KAFKA · {html.escape(err)}</span>')
     else:
         parts.append('<span class="tag tag-warn">no KAFKA_BROKERS</span>')
+
+    ch = event_store.status()
+    if event_store.ch_configured():
+        if ch["connected"]:
+            parts.append(
+                f'<span class="tag tag-live">CH · {ch["rows_inserted"]:,} ingested</span>'
+            )
+        else:
+            err = (ch["last_error"] or "connecting…")[:60]
+            parts.append(f'<span class="tag tag-warn">CH · {html.escape(err)}</span>')
+    else:
+        parts.append('<span class="tag tag-warn">no CLICKHOUSE_HOST</span>')
 
     if session:
         parts.append(
@@ -466,13 +503,30 @@ def render_alerts_panel() -> str:
     return _wrap("alerts", inner)
 
 
-def render_live_panel() -> str:
+def _recent_events(limit: int) -> list[dict]:
+    """Newest-first list of events. ClickHouse when configured (canonical
+    source); falls back to the in-memory deque so local dev / CH-down still
+    renders something."""
+    if event_store.ch_configured():
+        rows = event_store.query_recent(limit)
+        if rows:
+            return rows
     with state_lock:
-        feed = list(events)[-100:]
-    feed.reverse()
+        snap = list(events)
+    snap.reverse()
+    return snap[:limit]
+
+
+def render_live_panel() -> str:
+    feed = _recent_events(100)
+    total_label = (
+        f"{event_store.total_rows():,} total in CH"
+        if event_store.ch_configured() and event_store.status()["connected"]
+        else f"{len(events)} in memory"
+    )
     inner = f"""
 <section class="panel">
-  <h2>Live feed <span class="muted">({len(events)} buffered, showing last {len(feed)})</span></h2>
+  <h2>Live feed <span class="muted">({total_label}, showing last {len(feed)})</span></h2>
   {_render_feed(feed)}
 </section>"""
     return _wrap("live", inner)
@@ -480,12 +534,14 @@ def render_live_panel() -> str:
 
 def feed_json() -> str:
     """JSON payload for the side feed: most recent events, newest first."""
-    with state_lock:
-        snap = list(events)
-        total = len(events)
-    snap.reverse()
+    snap = _recent_events(80)
+    if event_store.ch_configured() and event_store.status()["connected"]:
+        total = event_store.total_rows()
+    else:
+        with state_lock:
+            total = len(events)
     out = []
-    for e in snap[:80]:
+    for e in snap:
         out.append({
             "ts": iso(e["ts"]),
             "success": e["success"],
@@ -496,25 +552,21 @@ def feed_json() -> str:
 
 
 def map_markers_json(window_s: int = DEFAULT_WINDOW_S) -> str:
-    """JSON payload for the Map tab. Pure data, no HTML."""
+    """JSON payload for the Map tab. Pure data, no HTML.
+
+    Reuses aggregates_snapshot so the source-of-truth (ClickHouse with
+    deque fallback) lives in one place. Adds geo + color/status classes
+    needed for Leaflet rendering."""
     n = now()
     with state_lock:
-        recent = [e for e in events if n - e["ts"] <= window_s]
         ban_map = dict(bans)
         allow = dict(allowlist)
         block = dict(blocklist)
-    by_ip: dict[str, dict] = {}
-    for e in recent:
-        row = by_ip.setdefault(e["ip"], {"ok": 0, "fail": 0, "last_user": "", "last_ts": 0})
-        if e["success"]:
-            row["ok"] += 1
-        else:
-            row["fail"] += 1
-        if e["ts"] > row["last_ts"]:
-            row["last_ts"] = e["ts"]
-            row["last_user"] = e["username"]
+
+    rows = aggregates_snapshot(window_s)
     markers = []
-    for ip, row in by_ip.items():
+    for r in rows:
+        ip = r["ip"]
         lat, lng, label = geolocate(ip)
         if ip in allow:
             color, status = "#6cdb8c", "allowlisted"
@@ -522,16 +574,16 @@ def map_markers_json(window_s: int = DEFAULT_WINDOW_S) -> str:
             color, status = "#ff4d63", "blocked"
         elif ip in ban_map and ban_map[ip]["expires_at"] > n:
             color, status = "#ff4d63", "banned"
-        elif row["fail"] >= 5:
+        elif r["fail"] >= 5:
             color, status = "#ff8a96", "hot"
-        elif row["fail"] > 0:
+        elif r["fail"] > 0:
             color, status = "#ffc14a", "mixed"
         else:
             color, status = "#6cb2ff", "clean"
         markers.append({
             "ip": ip, "lat": lat, "lng": lng, "label": label,
-            "ok": row["ok"], "fail": row["fail"],
-            "user": row["last_user"], "color": color, "status": status,
+            "ok": r["ok"], "fail": r["fail"],
+            "user": r["last_user"], "color": color, "status": status,
         })
     return json.dumps({
         "markers": markers,
@@ -1853,6 +1905,14 @@ def main():
     log(f"  ENABLE_SCENARIOS={ENABLE_SCENARIOS}")
     log(f"  kafka configured: {kafka_consumer.kafka_configured()}")
     log(f"  auth configured: {graphql_client.auth_configured()}")
+    log(f"  ch configured:    {event_store.ch_configured()}")
+
+    # Idempotent CREATE TABLE IF NOT EXISTS. On failure (CH down, bad
+    # credentials) we log and continue — the dashboard's read paths
+    # auto-fall-back to the in-memory deque, so a CH outage is degraded
+    # but not down. ensure_schema() runs again on the next deploy.
+    if event_store.ch_configured():
+        event_store.ensure_schema()
 
     threading.Thread(target=ban_sweeper, daemon=True).start()
     kafka_consumer.start(ingest_event)
